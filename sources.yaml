@@ -111,10 +111,16 @@ sources:
       - https://www.lankadeepa.lk/latest_news/1
       - https://www.lankadeepa.lk/breaking_news/1
     selectors:
-      item: ".news-item, article, .lead-story"
+      item: ".news-item, article, .lead-story, .cat-list-text, .me-item-text"
       link: "a"
       title: "h2, h3, .title"
       image: "img"
+      # Confirmed via inspect_dates.py: the listing shows an English date
+      # ("11 September 2026") here, so most articles need no extra fetch.
+      date: ".story-meta span, .story-meta"
+      # Article pages carry a Sinhala date with a time
+      # ("2026 සැප්තැම්බර් 12 | ප.ව. 06:34"), used when the listing has none.
+      article_date: ".article-meta"
 
   - id: mawbima
     name: Mawbima
@@ -162,6 +168,8 @@ sources:
       link: "a"
       title: "h2, h3, .title"
       image: "img"
+      date: "time, .date, .post-date, .story-meta span"
+      article_date: ".article-meta, .post-date, time"
 
   # ------------------------------------------------ added, from lk_news's list
   # These are outlets nuuuwan's dataset covers that we had missed. BBC in

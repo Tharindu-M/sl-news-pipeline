@@ -140,21 +140,31 @@ def main() -> int:
         # feed depends on this step. Prioritise the newest articles — those
         # are the ones users actually see.
         google = [a for a in fresh if "news.google.com" in a.url]
+        # A fabricated date is worse than a missing image: it pins the source
+        # to the top of the feed forever and shows users the wrong time.
+        undated = [a for a in fresh
+                   if a.date_estimated and "news.google.com" not in a.url]
         imageless = [a for a in fresh
-                     if "news.google.com" not in a.url and not a.image]
-        # A google link that never resolves is a broken link; a missing image
-        # is cosmetic. Do all of the former, then fill the rest with the latter.
-        needs = google + sorted(imageless, key=lambda a: a.published,
-                                reverse=True)[:250]
-        log.info("enriching %d articles (%d google links to resolve, "
-                 "%d missing images)", len(needs), len(google), len(needs) - len(google))
+                     if "news.google.com" not in a.url
+                     and not a.date_estimated and not a.image]
+        needs = google + undated + sorted(
+            imageless, key=lambda a: a.published, reverse=True)[:250]
+        log.info("enriching %d articles (%d google links, %d undated, "
+                 "%d missing images)", len(needs), len(google), len(undated),
+                 len(needs) - len(google) - len(undated))
         with ThreadPoolExecutor(max_workers=max(args.workers, 10)) as pool:
             list(pool.map(lambda a: enrich(client, a), needs))
         resolved = len(google) - sum(
             1 for a in google if "news.google.com" in a.url)
         got_image = sum(1 for a in needs if a.image)
-        log.info("enriched: %d/%d google links resolved, %d images found",
-                 resolved, len(google), got_image)
+        still_estimated = sum(1 for a in fresh if a.date_estimated)
+        log.info("enriched: %d/%d google links resolved, %d dates recovered, "
+                 "%d images found", resolved, len(google),
+                 len(undated) - sum(1 for a in undated if a.date_estimated),
+                 got_image)
+        if still_estimated:
+            log.warning("%d article(s) still carry a scrape-time date "
+                        "(no og:published_time on the page)", still_estimated)
         # enrich() rewrites google redirect URLs, which changes article ids.
         fresh = dedupe(fresh)
 
@@ -170,7 +180,9 @@ def main() -> int:
 
     for lang in ("en", "si", "ta"):
         previous = [
-            Article(**{k: v for k, v in d.items() if k in Article.__dataclass_fields__})
+            Article(stale=True,
+                    **{k: v for k, v in d.items()
+                       if k in Article.__dataclass_fields__ and k != "stale"})
             for d in load_previous(outdir, lang)
         ]
         combined = [a for a in fresh if a.lang == lang] + previous

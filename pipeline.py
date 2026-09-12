@@ -62,10 +62,24 @@ class Article:
     # Not serialised — used only to verify a resolved google redirect landed
     # on the right publisher.
     source_domain: str | None = None
+    # True when `published` is the scrape time rather than the publisher's.
+    # Listing pages rarely carry a date; enrich() repairs these from
+    # og:article:published_time. Never serialised.
+    date_estimated: bool = False
+    # Optional CSS selector for the date on this source's article pages, from
+    # `selectors.article_date` in sources.yaml. Never serialised.
+    date_selector: str | None = None
+    # True for records reloaded from the previous run's output. A freshly
+    # scraped record always wins a tie, because the old one may predate a
+    # parser fix — exactly what happened when Lankadeepa's fabricated
+    # timestamps outlived the fix that corrected them. Never serialised.
+    stale: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items()
-                if v is not None and k != "source_domain"}
+                if v is not None
+                and k not in ("source_domain", "date_estimated",
+                              "date_selector", "stale")}
 
     @property
     def published_dt(self) -> datetime:
@@ -128,6 +142,76 @@ def clean_text(html_or_text: str | None, limit: int = 220) -> str | None:
     return cut.rstrip(".,;:") + "\u2026"
 
 
+# ---------------------------------------------------------------------------
+# Sinhala / Tamil dates
+#
+# dateutil silently mis-parses these. Lankadeepa's article pages carry
+# "2026 සැප්තැම්බර් 12 | ප.ව. 06:34", which dateutil reads as 12 DECEMBER —
+# it ignores the Sinhala month name and takes the day number as the month.
+# A wrong date is worse than an obviously-missing one, so these are parsed
+# explicitly and dateutil is never allowed near them.
+# ---------------------------------------------------------------------------
+
+SI_MONTHS = {
+    "ජනවාරි": 1, "පෙබරවාරි": 2, "මාර්තු": 3, "අප්‍රේල්": 4, "අප්රේල්": 4,
+    "මැයි": 5, "ජූනි": 6, "ජුනි": 6, "ජූලි": 7, "ජුලි": 7, "අගෝස්තු": 8,
+    "සැප්තැම්බර්": 9, "සැප්තැම්": 9, "ඔක්තෝබර්": 10, "නොවැම්බර්": 11,
+    "දෙසැම්බර්": 12,
+}
+TA_MONTHS = {
+    "ஜனவரி": 1, "பிப்ரவரி": 2, "மார்ச்": 3, "ஏப்ரல்": 4, "மே": 5,
+    "ஜூன்": 6, "ஜூலை": 7, "ஆகஸ்ட்": 8, "செப்டம்பர்": 9, "அக்டோபர்": 10,
+    "நவம்பர்": 11, "டிசம்பர்": 12,
+}
+LOCAL_MONTHS = {**SI_MONTHS, **TA_MONTHS}
+
+# පෙ.ව. = forenoon, ප.ව. = afternoon. Check the AM forms first: "ප.ව." is a
+# substring of "පෙ.ව." once dots are stripped in some renderings.
+AM_MARKERS = ("පෙ.ව", "පෙව", "முற்பகல்", "காலை", "am")
+PM_MARKERS = ("ප.ව", "පව", "பிற்பகல்", "மாலை", "இரவு", "pm")
+
+
+def parse_local_date(text: str) -> datetime | None:
+    """Parse a Sinhala or Tamil date string, or return None."""
+    if not text:
+        return None
+    month = next((v for k, v in LOCAL_MONTHS.items() if k in text), None)
+    if month is None:
+        return None
+
+    year_m = re.search(r"\b(20\d{2})\b", text)
+    if not year_m:
+        return None
+    year = int(year_m.group(1))
+
+    rest = text[:year_m.start()] + " " + text[year_m.end():]
+    time_m = re.search(r"(\d{1,2})[:.](\d{2})", rest)
+    hour = minute = 0
+    if time_m:
+        hour, minute = int(time_m.group(1)), int(time_m.group(2))
+        rest = rest[:time_m.start()] + " " + rest[time_m.end():]
+
+    day_m = re.search(r"\b(\d{1,2})\b", rest)
+    if not day_m:
+        return None
+    day = int(day_m.group(1))
+
+    low = text.lower()
+    if time_m:
+        if any(m in low for m in AM_MARKERS):
+            if hour == 12:
+                hour = 0
+        elif any(m in low for m in PM_MARKERS):
+            if hour < 12:
+                hour += 12
+
+    try:
+        return datetime(year, month, day, hour, minute,
+                        tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    except ValueError:
+        return None
+
+
 def to_iso(value: Any) -> str | None:
     """Normalize any timestamp to ISO-8601 UTC. Rejects absurd dates."""
     if value is None:
@@ -138,7 +222,7 @@ def to_iso(value: Any) -> str | None:
         elif isinstance(value, datetime):
             dt = value
         else:
-            dt = dateparser.parse(str(value))
+            dt = parse_local_date(str(value)) or dateparser.parse(str(value))
     except (ValueError, TypeError, OverflowError):
         return None
     if dt is None:
@@ -417,6 +501,16 @@ def from_html(client: httpx.Client, src: dict, limit: int = 40) -> list[Article]
             if raw:
                 image = urljoin(src["site"], raw)
 
+        published, estimated = None, False
+        if sel.get("date"):
+            d_node = node.select_one(sel["date"])
+            if d_node is not None:
+                published = to_iso(d_node.get("datetime")
+                                   or d_node.get("content")
+                                   or d_node.get_text(strip=True))
+        if published is None:
+            published, estimated = to_iso(datetime.now(timezone.utc)), True
+
         out.append(Article(
             id=article_id(url),
             source_id=src["id"],
@@ -424,9 +518,10 @@ def from_html(client: httpx.Client, src: dict, limit: int = 40) -> list[Article]
             lang=src["lang"],
             title=title,
             url=url,
-            # Listing pages rarely carry a usable timestamp; enrich() fixes this.
-            published=to_iso(datetime.now(timezone.utc)),
+            published=published,
             image=image,
+            date_estimated=estimated,
+            date_selector=sel.get("article_date"),
         ))
         if len(out) >= limit:
             break
@@ -657,9 +752,32 @@ def enrich(client: httpx.Client, art: Article) -> Article:
     if not art.excerpt:
         art.excerpt = clean_text(meta("og:description", "description"))
 
-    better = to_iso(meta("article:published_time", "publishdate", "pubdate"))
+    better = to_iso(meta("article:published_time", "og:article:published_time",
+                         "publishdate", "pubdate", "date", "DC.date.issued"))
+    if not better:
+        for tag in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(tag.string or "{}")
+            except (ValueError, TypeError):
+                continue
+            for obj in (data if isinstance(data, list) else [data]):
+                if isinstance(obj, dict) and obj.get("datePublished"):
+                    better = to_iso(obj["datePublished"])
+                    break
+            if better:
+                break
+    if not better:
+        t = soup.find("time")
+        if t is not None:
+            better = to_iso(t.get("datetime") or t.get_text(strip=True))
+    if not better and art.date_selector:
+        node = soup.select_one(art.date_selector)
+        if node is not None:
+            better = to_iso(node.get("datetime") or node.get("content")
+                            or node.get_text(strip=True))
     if better:
         art.published = better
+        art.date_estimated = False
     return art
 
 
@@ -669,15 +787,19 @@ def dedupe(articles: Iterable[Article]) -> list[Article]:
     from the same outlet within an hour also collapse — wire copy gets
     republished under slightly different titles.
     """
+    def quality(x: Article) -> tuple[int, int, int]:
+        """Higher is better: fresh beats cached, real date beats estimated,
+        then richer metadata."""
+        return (
+            0 if x.stale else 1,
+            0 if x.date_estimated else 1,
+            sum(bool(v) for v in (x.image, x.excerpt, x.category)),
+        )
+
     by_id: dict[str, Article] = {}
     for a in articles:
         existing = by_id.get(a.id)
-        if existing is None:
-            by_id[a.id] = a
-            continue
-        # Prefer the record with more filled-in fields.
-        score = lambda x: sum(bool(v) for v in (x.image, x.excerpt, x.category))
-        if score(a) > score(existing):
+        if existing is None or quality(a) > quality(existing):
             by_id[a.id] = a
 
     out = sorted(by_id.values(), key=lambda x: x.published, reverse=True)
