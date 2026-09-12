@@ -62,19 +62,52 @@ def load_previous(outdir: Path, lang: str) -> list[dict]:
         return []
 
 
-def fetch_source(client, src: dict, max_items: int) -> tuple[str, list[Article], str | None]:
-    adapter = ADAPTERS.get(src.get("adapter", "rss"))
+def fetch_source(client, src: dict, max_items: int) -> tuple[str, list[Article], dict]:
+    """
+    Fetch one source, falling back to Google News if its own site refuses us.
+
+    This matters because a datacentre IP gets treated very differently from a
+    home connection: Ada Derana answers a UK browser but returns 403 from
+    CloudFront to a CI runner, and Divaina does the same via Cloudflare. Google
+    News reaches all of them, so a blocked source degrades to a slower, less
+    complete feed instead of disappearing.
+
+    The fallback is recorded, not silent — `status.json` shows which sources
+    are running on it so the primary adapter still gets fixed.
+    """
+    name = src.get("adapter", "rss")
+    adapter = ADAPTERS.get(name)
     if adapter is None:
-        return src["id"], [], f"unknown adapter {src.get('adapter')!r}"
+        return src["id"], [], {"ok": False, "error": f"unknown adapter {name!r}"}
+
     try:
         items = adapter(client, src, limit=max_items)
-        if not items:
-            d = diagnose_endpoint(client, src)
-            detail = " ".join(f"{k}={v}" for k, v in d.items() if k != "endpoint")
-            return src["id"], [], f"0 articles ({detail})"
-        return src["id"], items, None
     except Exception as e:
-        return src["id"], [], f"{type(e).__name__}: {e}"
+        items, primary_err = [], f"{type(e).__name__}: {e}"
+    else:
+        primary_err = None
+
+    if items:
+        return src["id"], items, {"ok": True, "error": None}
+
+    d = diagnose_endpoint(client, src)
+    detail = primary_err or " ".join(
+        f"{k}={v}" for k, v in d.items() if k != "endpoint")
+
+    # Last resort: Google News indexes nearly every one of these outlets and
+    # is not IP-blocked from CI.
+    if name != "google" and src.get("fallback", True):
+        try:
+            items = ADAPTERS["google"](client, src, limit=max_items)
+        except Exception:
+            items = []
+        if items:
+            return src["id"], items, {
+                "ok": True, "error": None, "used_fallback": "google",
+                "primary_error": f"0 articles ({detail})",
+            }
+
+    return src["id"], [], {"ok": False, "error": f"0 articles ({detail})"}
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -118,17 +151,20 @@ def main() -> int:
         futures = {pool.submit(fetch_source, client, s, max_items): s for s in sources}
         for fut in as_completed(futures):
             src = futures[fut]
-            sid, items, err = fut.result()
+            sid, items, outcome = fut.result()
             status[sid] = {
                 "name": src["name"],
                 "lang": src["lang"],
                 "adapter": src.get("adapter"),
                 "count": len(items),
-                "ok": err is None,
-                "error": err,
+                **outcome,
             }
-            if err:
-                log.warning("%-20s FAILED  %s", sid, err)
+            if not outcome["ok"]:
+                log.warning("%-20s FAILED  %s", sid, outcome["error"])
+            elif outcome.get("used_fallback"):
+                log.warning("%-20s %3d articles via GOOGLE FALLBACK (%s)",
+                            sid, len(items), outcome["primary_error"][:70])
+                fresh.extend(items)
             else:
                 log.info("%-20s %3d articles", sid, len(items))
                 fresh.extend(items)
@@ -224,6 +260,7 @@ def main() -> int:
     })
 
     ok = sum(1 for v in status.values() if v["ok"])
+    on_fallback = sorted(k for k, v in status.items() if v.get("used_fallback"))
     # Carry forward "last time this source produced anything", so a source
     # that dies quietly shows up as days-since rather than a single red run.
     # lk_news publishes the same idea as custom_summary.json; the difference
@@ -258,6 +295,7 @@ def main() -> int:
         "sources_total": len(sources),
         "totals": totals,
         "unresolved_google_links": google_total,
+        "on_fallback": on_fallback,
         "dead": dead,
         "detail": status,
     })
@@ -265,7 +303,11 @@ def main() -> int:
     if dead:
         log.warning("dead >48h (%d): %s", len(dead), ", ".join(dead))
 
-    log.info("done: %d/%d sources healthy", ok, len(sources))
+    if on_fallback:
+        log.warning("%d source(s) running on the Google fallback: %s",
+                    len(on_fallback), ", ".join(on_fallback))
+    log.info("done: %d/%d sources healthy (%d on fallback)",
+             ok, len(sources), len(on_fallback))
 
     # Fail the CI job if the pipeline is quietly rotting, so you find out
     # from a GitHub notification rather than from a user review.

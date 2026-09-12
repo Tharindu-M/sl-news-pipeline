@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Iterable
@@ -257,7 +258,12 @@ def make_client(user_agent: str | None = None, timeout: int | None = None) -> ht
     )
 
 
-def get(client: httpx.Client, url: str, quiet: bool = False) -> httpx.Response | None:
+# Edge responses that are often transient rather than a hard block.
+RETRY_STATUSES = {202, 429, 500, 502, 503, 504}
+
+
+def get(client: httpx.Client, url: str, quiet: bool = False,
+        attempts: int = 3) -> httpx.Response | None:
     """
     Fetch a URL, or None. Failures here are expected and non-fatal: a source
     can be down, rate-limiting us, or serving a bot challenge.
@@ -265,14 +271,26 @@ def get(client: httpx.Client, url: str, quiet: bool = False) -> httpx.Response |
     `quiet` is for per-article enrichment, where a failure costs an image
     rather than an article and would otherwise produce hundreds of log lines.
     """
-    try:
-        r = client.get(url)
-        r.raise_for_status()
-        return r
-    except httpx.HTTPError as e:
-        reason = str(e).split("\n")[0][:110]
-        (log.debug if quiet else log.warning)("GET failed %s: %s", url[:90], reason)
-        return None
+    last = ""
+    for attempt in range(attempts):
+        try:
+            r = client.get(url)
+            if r.status_code in RETRY_STATUSES and attempt < attempts - 1:
+                last = f"HTTP {r.status_code}"
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            return r
+        except httpx.TimeoutException as e:
+            last = f"{type(e).__name__}"
+            if attempt < attempts - 1:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+        except httpx.HTTPError as e:
+            last = str(e).split("\n")[0][:110]
+            break
+    (log.debug if quiet else log.warning)("GET failed %s: %s", url[:90], last)
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -66,14 +66,15 @@ jobs:
             catch { core.setFailed('Could not read status.json'); return; }
 
             const dead = s.dead || [];
-            const title = 'Dead news sources';
+            const fallback = s.on_fallback || [];
+            const title = 'News source problems';
             const { data: issues } = await github.rest.issues.listForRepo({
               owner: context.repo.owner, repo: context.repo.repo,
               state: 'open', labels: 'pipeline',
             });
             const existing = issues.find(i => i.title === title);
 
-            if (dead.length === 0) {
+            if (dead.length === 0 && fallback.length === 0) {
               if (existing) {
                 await github.rest.issues.update({
                   owner: context.repo.owner, repo: context.repo.repo,
@@ -90,13 +91,32 @@ jobs:
               return `| \`${id}\` | ${d.lang || '?'} | ${d.adapter || '?'} | ${h} | ${d.error || '0 articles'} |`;
             }).join('\n');
 
+            const fbRows = fallback.map(id => {
+              const d = s.detail[id] || {};
+              return `| \`${id}\` | ${d.lang || '?'} | ${d.adapter || '?'} | ${(d.primary_error || '').slice(0, 90)} |`;
+            }).join('\n');
+
             const body = [
-              `${dead.length} of ${s.sources_total} sources are dead (>48h).`,
+              dead.length
+                ? `${dead.length} of ${s.sources_total} sources are dead (>48h).`
+                : `All sources are returning articles.`,
               '',
-              '| source | lang | adapter | silent for | error |',
-              '|---|---|---|---|---|',
-              rows,
-              '',
+              ...(dead.length ? [
+                '| source | lang | adapter | silent for | error |',
+                '|---|---|---|---|---|',
+                rows,
+                '',
+              ] : []),
+              ...(fallback.length ? [
+                `### ${fallback.length} source(s) running on the Google fallback`,
+                'These still produce articles, but via Google News: staler, no',
+                'images until enrichment, and dependent on a private endpoint.',
+                '',
+                '| source | lang | intended adapter | why the primary failed |',
+                '|---|---|---|---|',
+                fbRows,
+                '',
+              ] : []),
               'Fix: `python probe.py --id <source>` to find a working adapter,',
               'then update `sources.yaml`. Prefer rss > wordpress > sitemap > html.',
               '',
