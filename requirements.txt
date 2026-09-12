@@ -4,3 +4,4 @@ beautifulsoup4>=4.12
 lxml>=5.0
 PyYAML>=6.0
 python-dateutil>=2.9
+pyflakes

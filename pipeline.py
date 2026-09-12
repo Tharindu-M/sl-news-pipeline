@@ -12,8 +12,9 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import time
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
 from typing import Any, Iterable
 from urllib.parse import (urljoin, urlparse, urlunparse, parse_qsl,
@@ -261,6 +262,25 @@ def make_client(user_agent: str | None = None, timeout: int | None = None) -> ht
 # Edge responses that are often transient rather than a hard block.
 RETRY_STATUSES = {202, 429, 500, 502, 503, 504}
 
+# Google News rate-limits aggressively, and the pipeline hits it from several
+# worker threads at once — ten sources on the google adapter, plus fallbacks,
+# plus one link-resolution request per article. Serialise those requests with
+# a small gap so a burst can't get the whole run throttled.
+_google_lock = threading.Lock()
+_google_last = 0.0
+GOOGLE_MIN_GAP = 0.35
+
+
+def _throttle_google(url: str) -> None:
+    global _google_last
+    if "google.com" not in url:
+        return
+    with _google_lock:
+        gap = time.monotonic() - _google_last
+        if gap < GOOGLE_MIN_GAP:
+            time.sleep(GOOGLE_MIN_GAP - gap)
+        _google_last = time.monotonic()
+
 
 def get(client: httpx.Client, url: str, quiet: bool = False,
         attempts: int = 3) -> httpx.Response | None:
@@ -274,6 +294,7 @@ def get(client: httpx.Client, url: str, quiet: bool = False,
     last = ""
     for attempt in range(attempts):
         try:
+            _throttle_google(url)
             r = client.get(url)
             if r.status_code in RETRY_STATUSES and attempt < attempts - 1:
                 last = f"HTTP {r.status_code}"
@@ -630,10 +651,99 @@ def from_google_news(client: httpx.Client, src: dict, limit: int = 40) -> list[A
         items = _parse_google_feed(r.content, src, domain, limit)
         if len(items) > len(best):
             best = items
-        # Good enough — stop paying for more requests.
-        if len(best) >= min(limit, 20):
+        # Good enough — stop paying for more requests, and more importantly
+        # stop adding to the request burst Google is measuring.
+        if len(best) >= min(limit, 10):
             break
     return best
+
+
+GOOGLE_HOSTS = ("news.google.com", "consent.google.com")
+
+# Payload skeleton for Google's internal batchexecute endpoint. This is the
+# only reliable way to turn a modern opaque article id (AU_yqL...) into a
+# publisher URL, and unlike following the redirect it is not affected by the
+# EU/UK consent interstitial.
+_GARTURL_ARGS = [
+    "garturlreq",
+    [["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1,
+      None, None, None, None, None, 0, 1],
+     "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0],
+]
+
+
+def _parse_batchexecute(text: str) -> str | None:
+    """Pull the resolved URL out of a batchexecute response body."""
+    for line in text.splitlines():
+        if "garturlres" not in line:
+            continue
+        try:
+            outer = json.loads(line)
+        except ValueError:
+            continue
+        for part in outer if isinstance(outer, list) else []:
+            if not (isinstance(part, list) and len(part) > 2):
+                continue
+            try:
+                inner = json.loads(part[2])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(inner, list) and len(inner) > 1 and isinstance(inner[1], str):
+                if inner[1].startswith("http"):
+                    return inner[1]
+    return None
+
+
+def _decode_via_batchexecute(client: httpx.Client, url: str) -> str | None:
+    """Strategy 1: ask Google's own endpoint what the article id points to."""
+    r = get(client, url, quiet=True)
+    if r is None:
+        return None
+    soup = BeautifulSoup(r.text, "lxml")
+    node = soup.select_one("c-wiz > div") or soup.select_one("[data-n-a-sg]")
+    if node is None:
+        return None
+    sig, ts = node.get("data-n-a-sg"), node.get("data-n-a-ts")
+    aid = node.get("data-n-a-id") or url.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
+    if not (sig and ts):
+        return None
+
+    payload = [[["Fbv4je", json.dumps(_GARTURL_ARGS + [aid, ts, sig]), None, "generic"]]]
+    try:
+        _throttle_google(url)
+        resp = client.post(
+            "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+            data={"f.req": json.dumps(payload)},
+            headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        log.debug("batchexecute failed: %s", e)
+        return None
+    return _parse_batchexecute(resp.text)
+
+
+def _clear_consent(client: httpx.Client, resp: httpx.Response) -> bool:
+    """
+    Strategy 2 prerequisite: submit Google's consent form once.
+
+    From an EU/UK IP every redirect lands on consent.google.com. Posting the
+    form's hidden fields sets the cookies for the rest of the session.
+    """
+    soup = BeautifulSoup(resp.text, "lxml")
+    form = soup.find("form")
+    if form is None:
+        return False
+    action = form.get("action") or "https://consent.google.com/save"
+    fields = {i.get("name"): i.get("value", "")
+              for i in form.find_all("input") if i.get("name")}
+    if not fields:
+        return False
+    try:
+        client.post(urljoin(str(resp.url), action), data=fields)
+        return True
+    except httpx.HTTPError:
+        return False
 
 
 def resolve_google_url(

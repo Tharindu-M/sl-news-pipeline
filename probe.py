@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 
 import yaml
 
-from pipeline import (ADAPTERS, ADAPTER_PREFERENCE, make_client, get,
+from pipeline import (ADAPTERS, ADAPTER_PREFERENCE, make_client,
                       discover_sitemaps)
 
 # Endpoints worth checking by hand when every adapter returns nothing.
@@ -136,7 +136,6 @@ def main() -> int:
     cfg = yaml.safe_load(open(args.config, encoding="utf-8"))
     defaults = cfg.get("defaults", {})
     sources = [s for s in cfg["sources"] if s.get("enabled", True)]
-    parked = len(cfg["sources"]) - len(sources)
     if args.id:   # --id overrides `enabled: false` so you can debug a parked source
         sources = [s for s in cfg["sources"] if s["id"] == args.id]
     if args.lang:

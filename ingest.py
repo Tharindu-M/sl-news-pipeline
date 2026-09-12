@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -319,11 +318,21 @@ def main() -> int:
     log.info("done: %d/%d sources healthy (%d on fallback)",
              ok, len(sources), len(on_fallback))
 
-    # Fail the CI job if the pipeline is quietly rotting, so you find out
-    # from a GitHub notification rather than from a user review.
-    if ok < len(sources) * 0.5:
-        log.error("More than half of sources are failing.")
+    # Fail the CI job only when the output is genuinely unusable, so you find
+    # out from a notification rather than from a user review — but a couple of
+    # blocked sources running on the fallback is not a build failure.
+    empty_langs = [lang for lang, n in totals.items() if n == 0]
+    if empty_langs:
+        log.error("FAILING: no articles at all for %s", ", ".join(empty_langs))
         return 1
+    if ok < len(sources) * 0.4:
+        log.error("FAILING: only %d of %d sources produced articles. "
+                  "See status.json `detail` for per-source errors.",
+                  ok, len(sources))
+        return 1
+    if ok < len(sources):
+        log.warning("%d of %d sources produced nothing — run continues",
+                    len(sources) - ok, len(sources))
     return 0
 
 
