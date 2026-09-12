@@ -123,6 +123,34 @@ def is_google_news(url: str) -> bool:
     return valid_web_url(url, ("news.google.com",))
 
 
+# A verified (non-estimated) publish time newer than this is what "usable"
+# means during adapter selection. This is a selection heuristic, separate
+# from the per-source `max_age_hours` used for reporting in ingest.py.
+FRESH_WINDOW_HOURS = 48
+
+
+def freshest_age_hours(items: Iterable["Article"]) -> float | None:
+    """Hours since the most recent *verified* publish time, or None.
+
+    Estimated (scrape-time) dates never count: they cannot prove an outlet
+    actually published anything recently.
+    """
+    now = datetime.now(timezone.utc)
+    ages = [(now - a.published_dt).total_seconds() / 3600
+            for a in items if not a.date_estimated]
+    return min(ages) if ages else None
+
+
+def count_fresh(items: Iterable["Article"], window_hours: float = FRESH_WINDOW_HOURS) -> int:
+    """How many items carry a verified publish time within the window."""
+    now = datetime.now(timezone.utc)
+    return sum(
+        1 for a in items
+        if not a.date_estimated
+        and (now - a.published_dt).total_seconds() / 3600 <= window_hours
+    )
+
+
 def canonical_url(url: str, base: str | None = None) -> str:
     """
     Absolute, tracking-free URL — the one we store and open.
@@ -502,20 +530,34 @@ def from_sitemap(client: httpx.Client, src: dict, limit: int = 40) -> list[Artic
     Any outlet that wants to appear in Google News publishes one. It is
     structured XML with title, publication date and language — better than
     scraping and nearly as reliable as RSS.
+
+    A sitemap index sometimes contains one child per year or per offset with
+    no "news" hint in its name (e.g. numeric-offset archives). Picking only
+    the first such child can silently return years-old articles from an
+    otherwise-healthy source. When a batch isn't fresh and other candidates
+    remain, keep looking rather than accepting the first non-empty result.
     """
     urls = [src["sitemap"]] if src.get("sitemap") else discover_sitemaps(client, src["site"])
 
-    for sm_url in urls:
+    best: list[Article] = []
+    best_age: float | None = None
+    seen_index = 0
+    while seen_index < len(urls):
+        sm_url = urls[seen_index]
+        seen_index += 1
         r = get(client, sm_url)
         if r is None:
             continue
         soup = BeautifulSoup(r.content, "xml")
 
-        # A sitemap index points at other sitemaps; follow the first news-ish one.
+        # A sitemap index points at other sitemaps; follow news-ish children,
+        # and — if none are named for it — sample both ends of the list
+        # rather than assuming the first entry is the newest.
         if soup.find("sitemapindex"):
             children = [loc.get_text(strip=True) for loc in soup.find_all("loc")]
-            news_children = [c for c in children if "news" in c.lower()] or children[:1]
-            urls.extend(c for c in news_children[:2] if c not in urls)
+            news_children = [c for c in children if "news" in c.lower()]
+            candidates = news_children[:2] or (children[:1] + children[-1:])
+            urls.extend(c for c in candidates if c not in urls)
             continue
 
         out: list[Article] = []
@@ -550,9 +592,17 @@ def from_sitemap(client: httpx.Client, src: dict, limit: int = 40) -> list[Artic
                 url=url,
                 published=published,
             ))
-        if out:
+        if not out:
+            continue
+
+        age = freshest_age_hours(out)
+        if age is not None and age <= FRESH_WINDOW_HOURS:
             return out
-    return []
+        if best_age is None or (age is not None and age < best_age):
+            best, best_age = out, age
+        elif not best:
+            best = out
+    return best
 
 
 def from_html(client: httpx.Client, src: dict, limit: int = 40) -> list[Article]:
@@ -702,21 +752,27 @@ def from_google_news(client: httpx.Client, src: dict, limit: int = 40) -> list[A
     """
     Adapter 5: last resort. Never pin this if a direct adapter works.
 
-    Tries several query forms and keeps the most productive, because a single
-    form silently returns near-zero for some outlets.
+    Tries several query forms and keeps the most useful, ranked by verified
+    freshness first and raw count second — a query that returns 40 results
+    all months old is worse than one returning 5 from today, and picking by
+    quantity alone silently prefers the former.
     """
     domain = urlparse(src["site"]).netloc.lower().removeprefix("www.")
     best: list[Article] = []
+    best_score = (-1, -1)
     for url in _google_variants(src):
         r = get(client, url, quiet=True)
         if r is None:
             continue
         items = _parse_google_feed(r.content, src, domain, limit)
-        if len(items) > len(best):
-            best = items
+        if not items:
+            continue
+        score = (count_fresh(items), len(items))
+        if score > best_score:
+            best, best_score = items, score
         # Good enough — stop paying for more requests, and more importantly
         # stop adding to the request burst Google is measuring.
-        if len(best) >= min(limit, 10):
+        if best_score[0] >= min(limit, 10):
             break
     return best
 
@@ -903,6 +959,8 @@ def diagnose_endpoint(client: httpx.Client, src: dict) -> dict[str, Any]:
     info: dict[str, Any] = {"endpoint": url}
     try:
         r = client.get(url)
+        if r.history:
+            info["redirect_chain"] = [str(h.url)[:160] for h in r.history[:6]] + [str(r.url)[:160]]
         info.update(
             status=r.status_code,
             server=r.headers.get("server", "")[:40],
@@ -916,8 +974,14 @@ def diagnose_endpoint(client: httpx.Client, src: dict) -> dict[str, Any]:
             info["hint"] = "endpoint moved — re-run probe.py"
         elif r.status_code == 200 and info["bytes"] < 500:
             info["hint"] = "200 but almost empty — likely a challenge page"
+        elif r.status_code == 200 and info.get("redirect_chain") and len(
+                {urlparse(u).path for u in info["redirect_chain"]}) == 1:
+            info["hint"] = "redirects to itself — likely bot mitigation, not a moved endpoint"
         elif r.status_code == 200:
             info["hint"] = "200 with content — our parser is the problem"
+    except httpx.TooManyRedirects as e:
+        info["exception"] = f"redirect loop: {str(e).splitlines()[0][:90]}"
+        info["hint"] = "server redirects endlessly for this client — likely bot mitigation"
     except httpx.HTTPError as e:
         info["exception"] = f"{type(e).__name__}: {str(e).splitlines()[0][:90]}"
     return {k: v for k, v in info.items() if v is not None}

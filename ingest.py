@@ -35,7 +35,7 @@ from dateutil import parser as dateparser
 
 from pipeline import (ADAPTERS, ADAPTER_PREFERENCE, Article, dedupe,
                       diagnose_endpoint, enrich, make_client, is_google_news,
-                      valid_web_url)
+                      valid_web_url, freshest_age_hours, FRESH_WINDOW_HOURS)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,6 +64,20 @@ def load_previous(outdir: Path, lang: str) -> list[dict]:
         return []
 
 
+def load_previous_payload(outdir: Path, name: str) -> dict | None:
+    """The last accepted file's full contents, verbatim — used to preserve a
+    language's snapshot (and its original `generated` timestamp) unchanged
+    when this run's output doesn't clear the quality bar for it."""
+    path = outdir / API_VERSION / name
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as e:
+        log.warning("could not read previous %s: %s", path, e)
+        return None
+
+
 def _can_try(adapter: str, src: dict) -> bool:
     """Whether a source has the config an adapter needs to run at all."""
     if adapter == "rss":
@@ -75,13 +89,20 @@ def _can_try(adapter: str, src: dict) -> bool:
 
 def fetch_source(client, src: dict, max_items: int) -> tuple[str, list[Article], dict]:
     """
-    Fetch one source, walking down the adapter ladder if its site refuses us.
+    Fetch one source, walking down the adapter ladder if its site refuses us
+    OR if it answered with only stale/unverified content.
 
     A datacentre IP is treated very differently from a home connection: Ada
     Derana answers a UK browser but returns 403 from CloudFront to a CI
     runner, and Divaina does the same via Cloudflare. Those rules are usually
     per-endpoint rather than per-domain, so a blocked /wp-json often sits
     beside a perfectly open RSS feed — worth trying before resorting to Google.
+
+    A non-empty result is not the same as a *usable* one: a frozen sitemap
+    index or an abandoned feed can return HTTP 200 with years-old articles
+    every single run. "usable" here means at least one verified (not
+    scrape-time-estimated) publish date within the source's freshness
+    window; anything else keeps walking the fallback ladder.
 
     Any fallback is recorded rather than silent: status.json names the adapter
     actually used and keeps the original error, so the primary still gets
@@ -92,6 +113,12 @@ def fetch_source(client, src: dict, max_items: int) -> tuple[str, list[Article],
     if adapter is None:
         return src["id"], [], {"ok": False, "error": f"unknown adapter {name!r}"}
 
+    window = src.get("max_age_hours", FRESH_WINDOW_HOURS)
+
+    def usable(items: list[Article]) -> bool:
+        age = freshest_age_hours(items)
+        return age is not None and age <= window
+
     try:
         items = adapter(client, src, limit=max_items)
     except Exception as e:
@@ -99,40 +126,55 @@ def fetch_source(client, src: dict, max_items: int) -> tuple[str, list[Article],
     else:
         primary_err = None
 
-    if items:
+    if items and usable(items):
         return src["id"], items, {"ok": True, "error": None}
 
     d = diagnose_endpoint(client, src)
     detail = primary_err or " ".join(
         f"{k}={v}" for k, v in d.items() if k != "endpoint")
+    if items and not primary_err:
+        detail = f"0 usable (verified-fresh) articles of {len(items)} returned"
 
-    used = None
+    # Primary produced something, even if stale — keep it as the floor to beat.
+    best_items, best_label = items, None
     if src.get("fallback", True):
         for alt in ADAPTER_PREFERENCE:
             if alt == name or not _can_try(alt, src):
                 continue
             try:
-                items = ADAPTERS[alt](client, src, limit=max_items)
+                alt_items = ADAPTERS[alt](client, src, limit=max_items)
             except Exception:
-                items = []
-            if items:
-                used = alt
+                alt_items = []
+            if not alt_items:
+                continue
+            if usable(alt_items):
+                best_items, best_label = alt_items, alt
                 break
+            if len(alt_items) > len(best_items):
+                best_items, best_label = alt_items, alt
 
-    if used is None:
+    if not best_items:
         return src["id"], [], {"ok": False, "error": f"0 articles ({detail})"}
+
+    if best_label is None:
+        # Only the primary produced anything, and it was not usable (stale
+        # or undated). Report it honestly rather than a silent fallback.
+        return src["id"], best_items, {
+            "ok": False, "error": f"stale/unverified only ({detail})",
+        }
 
     # A fallback returning one or two articles is not a working source.
     MIN_USEFUL = 3
-    if len(items) >= MIN_USEFUL:
-        return src["id"], items, {
-            "ok": True, "error": None, "used_fallback": used,
-            "primary_error": f"0 articles ({detail})",
+    if len(best_items) >= MIN_USEFUL:
+        return src["id"], best_items, {
+            "ok": True, "error": None, "used_fallback": best_label,
+            "primary_error": detail,
         }
-    return src["id"], items, {
-        "ok": False, "used_fallback": used,
-        "primary_error": f"0 articles ({detail})",
-        "error": f"primary blocked; {used} returned only {len(items)} article(s)",
+    return src["id"], best_items, {
+        "ok": False, "used_fallback": best_label,
+        "primary_error": detail,
+        "error": f"primary blocked/stale; {best_label} returned only "
+                 f"{len(best_items)} article(s)",
     }
 
 
@@ -302,11 +344,31 @@ def main() -> int:
     # ---- merge with the previous run, then write ---------------------------
     cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
     generated = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now_dt = dateparser.parse(generated)
     totals: dict[str, int] = {}
     payloads: dict[str, dict] = {}
     previous_all: list[Article] = []
     for art in fresh:
         art.collected_at = art.collected_at or generated
+
+    # A language "passes" when enough *newly observed* articles came in from
+    # enough distinct sources — not merely when the merged feed is non-empty.
+    # `collected_at` is when an article was first seen (dedupe() preserves
+    # this across runs), so a stale source repeatedly re-serving the same
+    # old/undated articles cannot count as fresh forever the way a raw
+    # published-date check would let it.
+    LANG_MIN_FRESH = defaults.get("lang_min_fresh_articles", 3)
+    LANG_MIN_SOURCES = defaults.get("lang_min_sources", 1)
+    LANG_WARN_SOURCES = defaults.get("lang_warn_sources", 2)
+    LANG_FRESH_HOURS = defaults.get("lang_fresh_window_hours", 24)
+
+    def _first_seen_hours(a: Article) -> float:
+        try:
+            return (now_dt - dateparser.parse(a.collected_at or a.published)).total_seconds() / 3600
+        except (ValueError, TypeError, OverflowError):
+            return float("inf")
+
+    language_status: dict[str, dict] = {}
 
     for lang in ("en", "si", "ta"):
         previous = [
@@ -328,27 +390,72 @@ def main() -> int:
         merged = [a for a in dedupe(combined) if a.published_dt >= cutoff]
         totals[lang] = len(merged)
 
-        payloads[f"feed_{lang}.json"] = {
-            "version": API_VERSION,
-            "lang": lang,
-            "generated": generated,
-            "count": len(merged[:PER_FEED]),
-            "articles": [a.to_dict() for a in merged[:PER_FEED]],
+        fresh_candidates = [a for a in merged if _first_seen_hours(a) <= LANG_FRESH_HOURS]
+        fresh_sources = {a.source_id for a in fresh_candidates}
+        passes = (len(fresh_candidates) >= LANG_MIN_FRESH
+                  and len(fresh_sources) >= LANG_MIN_SOURCES)
+
+        prev_payload = load_previous_payload(outdir, f"feed_{lang}.json")
+
+        if passes:
+            state = "updated"
+            payloads[f"feed_{lang}.json"] = {
+                "version": API_VERSION,
+                "lang": lang,
+                "generated": generated,
+                "count": len(merged[:PER_FEED]),
+                "articles": [a.to_dict() for a in merged[:PER_FEED]],
+            }
+            for cat in CATEGORIES:
+                subset = [a for a in merged if a.category == cat][:PER_FEED]
+                if subset:
+                    payloads[f"feed_{lang}_{cat}.json"] = {
+                        "version": API_VERSION,
+                        "lang": lang,
+                        "category": cat,
+                        "generated": generated,
+                        "count": len(subset),
+                        "articles": [a.to_dict() for a in subset],
+                    }
+            log.info("feed_%s.json  %d articles (updated, %d fresh from %d source(s))",
+                     lang, len(merged[:PER_FEED]), len(fresh_candidates), len(fresh_sources))
+        elif prev_payload is not None:
+            state = "preserved"
+            payloads[f"feed_{lang}.json"] = prev_payload
+            for cat in CATEGORIES:
+                prev_cat = load_previous_payload(outdir, f"feed_{lang}_{cat}.json")
+                if prev_cat is not None:
+                    payloads[f"feed_{lang}_{cat}.json"] = prev_cat
+            log.warning("feed_%s.json  below quality bar (%d fresh article(s) from "
+                        "%d source(s), need >=%d from >=%d) -- preserving previous "
+                        "snapshot unchanged", lang, len(fresh_candidates),
+                        len(fresh_sources), LANG_MIN_FRESH, LANG_MIN_SOURCES)
+        else:
+            state = "unavailable"
+            log.warning("feed_%s.json  below quality bar and no previous snapshot "
+                        "to preserve -- no file published this run", lang)
+
+        snapshot_age_hours = None
+        prev_generated = (prev_payload or {}).get("generated") if state != "updated" else None
+        if state == "preserved" and prev_generated:
+            try:
+                snapshot_age_hours = round(
+                    (datetime.now(timezone.utc) - dateparser.parse(prev_generated))
+                    .total_seconds() / 3600, 1)
+            except (ValueError, TypeError):
+                snapshot_age_hours = None
+
+        language_status[lang] = {
+            "state": state,
+            "fresh_candidates": len(fresh_candidates),
+            "fresh_sources": len(fresh_sources),
+            "total_candidates": len(merged),
+            "snapshot_generated": generated if state == "updated" else prev_generated,
+            "snapshot_age_hours": snapshot_age_hours,
         }
-
-        for cat in CATEGORIES:
-            subset = [a for a in merged if a.category == cat][:PER_FEED]
-            if subset:
-                payloads[f"feed_{lang}_{cat}.json"] = {
-                    "version": API_VERSION,
-                    "lang": lang,
-                    "category": cat,
-                    "generated": generated,
-                    "count": len(subset),
-                    "articles": [a.to_dict() for a in subset],
-                }
-
-        log.info("feed_%s.json  %d articles", lang, len(merged[:PER_FEED]))
+        if state != "unavailable" and len(fresh_sources) < LANG_WARN_SOURCES:
+            language_status[lang]["warning"] = (
+                f"only {len(fresh_sources)} source(s) contributed fresh articles")
 
     payloads["sources.json"] = {
         "version": API_VERSION,
@@ -415,6 +522,7 @@ def main() -> int:
         "google_sources": google_sources,
         "stale_sources": stale_sources,
         "dead": dead,
+        "language_status": language_status,
         "detail": status,
     }
 
@@ -445,21 +553,40 @@ def main() -> int:
     log.info("done: %d/%d sources healthy (%d on fallback)",
              ok, len(sources), len(on_fallback))
 
-    # Fail the CI job only when the output is genuinely unusable, so you find
-    # out from a notification rather than from a user review — but a couple of
-    # blocked sources running on the fallback is not a build failure.
+    # Each language now makes its own accept/preserve decision above, so a
+    # weak day for one language no longer blocks the others. The whole run
+    # is only unusable when literally nothing can be shown for any language
+    # — nothing new, and nothing previously accepted to fall back to.
+    publishable = [l for l, s in language_status.items() if s["state"] != "unavailable"]
+    unavailable = [l for l, s in language_status.items() if s["state"] == "unavailable"]
+    preserved = [l for l, s in language_status.items() if s["state"] == "preserved"]
+
     errors = []
-    empty_langs = [lang for lang, n in totals.items() if n == 0]
+    # Zero articles from every source is a distinct, stronger signal than any
+    # single language falling below its quality bar: it usually means the
+    # runner's network is broken, not that publishers went quiet. The
+    # per-language grace window (recently-collected articles count as "fresh"
+    # for up to LANG_FRESH_HOURS) would otherwise happily re-publish the old
+    # snapshot and report success, hiding a total outage. Fail loudly instead;
+    # nothing is written below, so the previous accepted snapshot is untouched.
     if not fresh:
-        errors.append("No valid articles fetched")
-    if empty_langs:
-        log.error("FAILING: no articles at all for %s", ", ".join(empty_langs))
-        errors.append(f"No retained articles for: {', '.join(empty_langs)}")
+        log.error("FAILING: zero articles fetched from any source this run")
+        errors.append("No articles were fetched from any source this run")
+    if not publishable:
+        log.error("FAILING: every language is below the quality bar with no "
+                  "previous snapshot to preserve: %s", ", ".join(unavailable))
+        errors.append("No language has publishable or preserved content")
+    elif unavailable:
+        log.warning("%s has no previous snapshot and is below the quality bar "
+                    "this run — no file will be published for it",
+                    ", ".join(unavailable))
+    if preserved:
+        log.warning("preserving previous snapshot for: %s (see language_status "
+                    "in status.json)", ", ".join(preserved))
     if ok < len(sources) * 0.4:
-        log.error("FAILING: only %d of %d sources produced articles. "
-                  "See status.json `detail` for per-source errors.",
-                  ok, len(sources))
-        errors.append(f"Only {ok}/{len(sources)} sources succeeded")
+        log.warning("only %d of %d sources produced anything this run — "
+                    "see status.json `detail` for per-source errors",
+                    ok, len(sources))
     report["accepted"] = not errors
     report["errors"] = errors
     write_json(diagnostics, report)
