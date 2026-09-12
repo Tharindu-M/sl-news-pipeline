@@ -1,0 +1,86 @@
+name: Ingest news
+
+on:
+  schedule:
+    # Every 20 minutes. GitHub often runs cron a few minutes late and will
+    # occasionally skip a slot under load — fine for news, and the merge
+    # logic in ingest.py means a skipped run costs nothing.
+    - cron: "*/20 * * * *"
+  workflow_dispatch:        # lets you trigger a run by hand from the Actions tab
+  push:
+    branches: [main]
+    paths: ["sources.yaml", "pipeline.py", "ingest.py"]
+
+# Never let two runs write the feeds at once.
+concurrency:
+  group: ingest
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Pull down last run's output so ingest.py can merge rather than
+      # rebuild from scratch. Without this, a source being briefly down
+      # would make its articles disappear from users' apps.
+      - name: Restore previous feeds
+        uses: actions/cache/restore@v4
+        with:
+          path: public
+          key: feeds-${{ github.run_id }}
+          restore-keys: feeds-
+
+      - name: Run ingestion
+        run: python ingest.py --out public
+
+      - name: Save feeds
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: public
+          key: feeds-${{ github.run_id }}
+
+      # Health summary lands on the Actions run page.
+      - name: Report
+        if: always()
+        run: |
+          if [ -f public/v1/status.json ]; then
+            python - <<'PY' >> $GITHUB_STEP_SUMMARY
+          import json
+          s = json.load(open("public/v1/status.json"))
+          print(f"### {s['sources_ok']}/{s['sources_total']} sources healthy\n")
+          print(f"Articles: " + ", ".join(f"{k}={v}" for k, v in s["totals"].items()) + "\n")
+          bad = [(k, v) for k, v in s["detail"].items() if not v["ok"]]
+          if bad:
+              print("| source | adapter | error |")
+              print("|---|---|---|")
+              for k, v in bad:
+                  print(f"| {k} | {v['adapter']} | {v['error']} |")
+          PY
+          fi
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}

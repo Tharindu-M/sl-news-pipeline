@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""
+Build the static JSON API.
+
+Reads sources.yaml, runs each outlet's adapter, merges with whatever was
+published last run, and writes:
+
+    public/v1/feed_en.json      latest 150 English articles
+    public/v1/feed_si.json      latest 150 Sinhala
+    public/v1/feed_ta.json      latest 150 Tamil
+    public/v1/feed_en_politics.json   ... per category
+    public/v1/sources.json      outlet directory for the app
+    public/v1/status.json       per-source health, for you not the app
+
+Merging with the previous run matters: if a site is down for one cycle its
+articles stay in the feed instead of vanishing from users' apps.
+
+    python3 ingest.py --out public
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import yaml
+from dateutil import parser as dateparser
+
+from pipeline import ADAPTERS, Article, dedupe, enrich, make_client
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-7s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("ingest")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+API_VERSION = "v1"
+PER_FEED = 150
+RETENTION_DAYS = 14
+CATEGORIES = ["politics", "business", "sports", "tech", "international",
+              "entertainment", "society"]
+
+
+def load_previous(outdir: Path, lang: str) -> list[dict]:
+    path = outdir / API_VERSION / f"feed_{lang}.json"
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("articles", [])
+    except (ValueError, OSError) as e:
+        log.warning("could not read previous %s: %s", path, e)
+        return []
+
+
+def fetch_source(client, src: dict, max_items: int) -> tuple[str, list[Article], str | None]:
+    adapter = ADAPTERS.get(src.get("adapter", "rss"))
+    if adapter is None:
+        return src["id"], [], f"unknown adapter {src.get('adapter')!r}"
+    try:
+        items = adapter(client, src, limit=max_items)
+        if not items:
+            return src["id"], [], "0 articles"
+        return src["id"], items, None
+    except Exception as e:
+        return src["id"], [], f"{type(e).__name__}: {e}"
+
+
+def write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    tmp.replace(path)  # atomic — readers never see a half-written file
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="public")
+    ap.add_argument("--config", default="sources.yaml")
+    ap.add_argument("--no-enrich", action="store_true",
+                    help="skip per-article og:image fetches (much faster)")
+    ap.add_argument("--workers", type=int, default=6)
+    args = ap.parse_args()
+
+    cfg = yaml.safe_load(open(args.config, encoding="utf-8"))
+    defaults = cfg.get("defaults", {})
+    sources = [s for s in cfg["sources"] if s.get("enabled", True)]
+    parked = len(cfg["sources"]) - len(sources)
+    outdir = Path(args.out)
+    if parked:
+        log.info("%d source(s) parked via `enabled: false`", parked)
+
+    client = make_client(
+        user_agent=defaults.get("user_agent"),
+        timeout=defaults.get("timeout", 20),
+    )
+    max_items = defaults.get("max_items", 40)
+
+    # ---- fetch every source in parallel -----------------------------------
+    fresh: list[Article] = []
+    status: dict[str, dict] = {}
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(fetch_source, client, s, max_items): s for s in sources}
+        for fut in as_completed(futures):
+            src = futures[fut]
+            sid, items, err = fut.result()
+            status[sid] = {
+                "name": src["name"],
+                "lang": src["lang"],
+                "adapter": src.get("adapter"),
+                "count": len(items),
+                "ok": err is None,
+                "error": err,
+            }
+            if err:
+                log.warning("%-20s FAILED  %s", sid, err)
+            else:
+                log.info("%-20s %3d articles", sid, len(items))
+                fresh.extend(items)
+
+    if not fresh:
+        log.error("Every source failed. Refusing to overwrite good feeds with nothing.")
+        return 1
+
+    # ---- fill in missing images -------------------------------------------
+    if not args.no_enrich:
+        # sitemap and google adapters return no image at all, so most of the
+        # feed depends on this step. Prioritise the newest articles — those
+        # are the ones users actually see.
+        google = [a for a in fresh if "news.google.com" in a.url]
+        imageless = [a for a in fresh
+                     if "news.google.com" not in a.url and not a.image]
+        # A google link that never resolves is a broken link; a missing image
+        # is cosmetic. Do all of the former, then fill the rest with the latter.
+        needs = google + sorted(imageless, key=lambda a: a.published,
+                                reverse=True)[:250]
+        log.info("enriching %d articles (%d google links to resolve, "
+                 "%d missing images)", len(needs), len(google), len(needs) - len(google))
+        with ThreadPoolExecutor(max_workers=max(args.workers, 10)) as pool:
+            list(pool.map(lambda a: enrich(client, a), needs))
+        resolved = len(google) - sum(
+            1 for a in google if "news.google.com" in a.url)
+        got_image = sum(1 for a in needs if a.image)
+        log.info("enriched: %d/%d google links resolved, %d images found",
+                 resolved, len(google), got_image)
+        # enrich() rewrites google redirect URLs, which changes article ids.
+        fresh = dedupe(fresh)
+
+    google_total = sum(1 for a in fresh if a.source_id and "news.google.com" in a.url)
+    if google_total:
+        log.warning("%d article(s) still point at news.google.com "
+                    "(consent wall or unresolvable id)", google_total)
+
+    # ---- merge with the previous run, then write ---------------------------
+    cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+    generated = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    totals: dict[str, int] = {}
+
+    for lang in ("en", "si", "ta"):
+        previous = [
+            Article(**{k: v for k, v in d.items() if k in Article.__dataclass_fields__})
+            for d in load_previous(outdir, lang)
+        ]
+        combined = [a for a in fresh if a.lang == lang] + previous
+        merged = [a for a in dedupe(combined) if a.published_dt >= cutoff]
+        totals[lang] = len(merged)
+
+        write_json(outdir / API_VERSION / f"feed_{lang}.json", {
+            "version": API_VERSION,
+            "lang": lang,
+            "generated": generated,
+            "count": len(merged[:PER_FEED]),
+            "articles": [a.to_dict() for a in merged[:PER_FEED]],
+        })
+
+        for cat in CATEGORIES:
+            subset = [a for a in merged if a.category == cat][:PER_FEED]
+            if subset:
+                write_json(outdir / API_VERSION / f"feed_{lang}_{cat}.json", {
+                    "version": API_VERSION,
+                    "lang": lang,
+                    "category": cat,
+                    "generated": generated,
+                    "count": len(subset),
+                    "articles": [a.to_dict() for a in subset],
+                })
+
+        log.info("feed_%s.json  %d articles", lang, len(merged[:PER_FEED]))
+
+    write_json(outdir / API_VERSION / "sources.json", {
+        "version": API_VERSION,
+        "generated": generated,
+        "sources": [
+            {"id": s["id"], "name": s["name"], "lang": s["lang"], "site": s["site"]}
+            for s in sources
+        ],
+    })
+
+    ok = sum(1 for v in status.values() if v["ok"])
+    # Carry forward "last time this source produced anything", so a source
+    # that dies quietly shows up as days-since rather than a single red run.
+    # lk_news publishes the same idea as custom_summary.json; the difference
+    # is that this one has memory, which is what makes alerting possible.
+    history_path = outdir / API_VERSION / "status.json"
+    previous_detail = {}
+    if history_path.exists():
+        try:
+            previous_detail = json.loads(history_path.read_text(encoding="utf-8")).get("detail", {})
+        except (ValueError, OSError):
+            pass
+
+    for sid, info in status.items():
+        if info["ok"] and info["count"]:
+            info["last_ok"] = generated
+        else:
+            info["last_ok"] = (previous_detail.get(sid) or {}).get("last_ok")
+        if info["last_ok"]:
+            delta = datetime.now(timezone.utc) - dateparser.parse(info["last_ok"])
+            info["hours_since_ok"] = round(delta.total_seconds() / 3600, 1)
+        else:
+            info["hours_since_ok"] = None
+
+    dead = sorted(
+        sid for sid, i in status.items()
+        if i["hours_since_ok"] is None or i["hours_since_ok"] > 48
+    )
+
+    write_json(history_path, {
+        "generated": generated,
+        "sources_ok": ok,
+        "sources_total": len(sources),
+        "totals": totals,
+        "unresolved_google_links": google_total,
+        "dead": dead,
+        "detail": status,
+    })
+
+    if dead:
+        log.warning("dead >48h (%d): %s", len(dead), ", ".join(dead))
+
+    log.info("done: %d/%d sources healthy", ok, len(sources))
+
+    # Fail the CI job if the pipeline is quietly rotting, so you find out
+    # from a GitHub notification rather than from a user review.
+    if ok < len(sources) * 0.5:
+        log.error("More than half of sources are failing.")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

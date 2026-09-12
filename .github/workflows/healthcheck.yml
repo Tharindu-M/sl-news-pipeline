@@ -1,0 +1,116 @@
+name: Health check
+
+# The lesson from nuuuwan/lk_news: after four years of maintenance, 13 of its
+# 17 scrapers silently produce nothing. Nobody gets paged, so nobody notices.
+#
+# This runs once a day against the live feeds and opens (or updates) a single
+# GitHub issue listing every source that has been dead for more than 48 hours.
+# You find out from a notification, not from a one-star review.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"      # 08:30 Sri Lanka time
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch live status
+        id: status
+        env:
+          FEED_BASE: ${{ vars.FEED_BASE }}   # e.g. https://user.github.io/repo
+        run: |
+          set -euo pipefail
+          curl -fsS "$FEED_BASE/v1/status.json" -o status.json
+
+          # Every feed must exist and be non-empty. Borrowed from
+          # KOTTAGENVH's scraper_check.yaml, which asserts the same per source.
+          for lang in en si ta; do
+            curl -fsS "$FEED_BASE/v1/feed_$lang.json" \
+              | jq -e '.articles | length > 0' > /dev/null \
+              || { echo "::error::feed_$lang.json is empty or missing"; exit 1; }
+          done
+
+          # Feeds must be fresh. A frozen pipeline that still serves 200s is
+          # exactly how brief.lk looked for seven weeks.
+          age=$(curl -fsS "$FEED_BASE/v1/feed_en.json" \
+            | jq -r '.generated' \
+            | xargs -I{} date -d {} +%s)
+          now=$(date +%s)
+          hours=$(( (now - age) / 3600 ))
+          echo "Feeds generated ${hours}h ago"
+          if [ "$hours" -gt 6 ]; then
+            echo "::error::Feeds are ${hours}h stale — the ingest job is not running"
+            exit 1
+          fi
+
+          {
+            echo "dead<<EOF"
+            jq -r '.dead[]?' status.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Report dead sources
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let s;
+            try { s = JSON.parse(fs.readFileSync('status.json', 'utf8')); }
+            catch { core.setFailed('Could not read status.json'); return; }
+
+            const dead = s.dead || [];
+            const title = 'Dead news sources';
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'pipeline',
+            });
+            const existing = issues.find(i => i.title === title);
+
+            if (dead.length === 0) {
+              if (existing) {
+                await github.rest.issues.update({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: existing.number, state: 'closed',
+                });
+              }
+              core.info('All sources healthy.');
+              return;
+            }
+
+            const rows = dead.map(id => {
+              const d = s.detail[id] || {};
+              const h = d.hours_since_ok == null ? 'never' : `${d.hours_since_ok}h`;
+              return `| \`${id}\` | ${d.lang || '?'} | ${d.adapter || '?'} | ${h} | ${d.error || '0 articles'} |`;
+            }).join('\n');
+
+            const body = [
+              `${dead.length} of ${s.sources_total} sources are dead (>48h).`,
+              '',
+              '| source | lang | adapter | silent for | error |',
+              '|---|---|---|---|---|',
+              rows,
+              '',
+              'Fix: `python probe.py --id <source>` to find a working adapter,',
+              'then update `sources.yaml`. Prefer rss > wordpress > sitemap > html.',
+              '',
+              `_Last run: ${s.generated}_`,
+            ].join('\n');
+
+            if (existing) {
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['pipeline'],
+              });
+            }

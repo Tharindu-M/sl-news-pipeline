@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+public/
+tests/out/
+tests/tmp.yaml
+.venv/

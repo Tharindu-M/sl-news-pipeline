@@ -1,0 +1,228 @@
+# Sri Lankan news source registry.
+#
+# `adapter` is resolved by running probe.py — do NOT trust the values below
+# until you have. They are starting guesses. probe.py tests each outlet for
+# RSS, the WordPress REST API, and a news sitemap, and prints the adapter
+# that actually returns articles.
+#
+# adapter: rss | wordpress | sitemap | html
+#
+# Once an outlet is confirmed, pin the adapter and the exact URL here. When a
+# site breaks, you change this file and re-run — no app release needed.
+
+defaults:
+  timeout: 20
+  max_items: 40
+  # Some Sri Lankan sites reject non-browser agents outright.
+  user_agent: >-
+    Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+    (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36
+
+sources:
+
+  # ---------------------------------------------------------------- English
+
+  - id: ada-derana-en
+    name: Ada Derana
+    lang: en
+    site: https://www.adaderana.lk
+    adapter: sitemap         # CONFIRMED: 10 items, 1h old
+    feeds:                  # re-test these; probe skipped rss due to a bug
+      - https://www.adaderana.lk/rss.php
+      - https://www.adaderana.lk/rss.xml
+
+  - id: daily-mirror
+    name: Daily Mirror
+    lang: en
+    site: https://www.dailymirror.lk
+    adapter: google         # fallback until a direct adapter is found
+    # These were dropped by an earlier edit, so RSS was never actually tested
+    # on this outlet. Try them: `python probe.py --id daily-mirror`.
+    feeds:
+      - https://www.dailymirror.lk/rss/108/breaking-news
+      - https://www.dailymirror.lk/RSS_Feeds/breaking-news
+      - https://www.dailymirror.lk/rss.xml
+    listings:
+      - https://www.dailymirror.lk/latest-news/342
+      - https://www.dailymirror.lk/top-storys/155
+      - https://www.dailymirror.lk/business
+    # First attempt used lk_news's "div.col-md-8", which matched the page
+    # chrome and produced 2 items headlined "E-PAPER". Narrow to the story
+    # cards themselves; verify with: python probe.py --id daily-mirror
+    selectors:
+      item: "div.col-md-8 div.row, article, .lineg"
+      link: "a[href*='/']"
+      title: "h2, h3, .lineg a"
+      image: "img"
+
+  - id: economynext
+    name: EconomyNext
+    lang: en
+    site: https://economynext.com
+    adapter: wordpress       # CONFIRMED: 10 items, all with images
+
+  - id: newswire
+    name: Newswire
+    lang: en
+    site: https://www.newswire.lk
+    adapter: wordpress       # CONFIRMED: 10 items, all with images
+
+  - id: newsfirst-en
+    name: NewsFirst
+    lang: en
+    site: https://english.newsfirst.lk
+    adapter: google          # google only, 3h old
+
+  - id: daily-ft
+    name: Daily FT
+    lang: en
+    site: https://www.ft.lk
+    adapter: google          # google only, 18h old
+
+  - id: the-morning
+    name: The Morning
+    lang: en
+    site: https://www.themorning.lk
+    adapter: google          # google only, 35h old
+
+  # ---------------------------------------------------------------- Sinhala
+
+  - id: ada-derana-si
+    name: Ada Derana Sinhala
+    lang: si
+    site: https://sinhala.adaderana.lk
+    adapter: sitemap         # CONFIRMED: 10 items, 0h old
+    feeds:                  # re-test; probe skipped rss due to a bug
+      - https://sinhala.adaderana.lk/rss.php
+      - https://sinhala.adaderana.lk/rss.xml
+
+  - id: divaina
+    name: Divaina
+    lang: si
+    site: https://www.divaina.lk
+    adapter: wordpress       # CONFIRMED: 10 items, 9 with images
+
+  - id: lankadeepa
+    name: Lankadeepa
+    lang: si
+    site: https://www.lankadeepa.lk
+    adapter: html            # CONFIRMED: 10 items, all with images
+    listings:
+      - https://www.lankadeepa.lk/latest_news/1
+      - https://www.lankadeepa.lk/breaking_news/1
+    selectors:
+      item: ".news-item, article, .lead-story"
+      link: "a"
+      title: "h2, h3, .title"
+      image: "img"
+
+  - id: mawbima
+    name: Mawbima
+    lang: si
+    site: https://www.mawbima.lk
+    adapter: google
+    enabled: false        # not indexed by Google News; needs selectors
+                          # re-enable: probe.py --id mawbima --diagnose
+
+  # ------------------------------------------------------------------ Tamil
+
+  - id: ada-derana-ta
+    name: Ada Derana Tamil
+    lang: ta
+    site: https://tamil.adaderana.lk
+    adapter: google
+    enabled: false        # check the real URL — tamil.adaderana.lk may be wrong
+                          # re-enable: probe.py --id ada-derana-ta --diagnose
+    feed: https://tamil.adaderana.lk/rss.php
+
+  - id: virakesari
+    name: Virakesari
+    lang: ta
+    site: https://www.virakesari.lk
+    adapter: google          # google only, 33h old
+
+  - id: thinakkural
+    name: Thinakkural
+    lang: ta
+    site: https://www.thinakkural.lk
+    adapter: google
+    enabled: false        # not indexed by Google News; needs selectors
+                          # re-enable: probe.py --id thinakkural --diagnose
+
+  - id: tamil-mirror
+    name: Tamil Mirror
+    lang: ta
+    site: https://www.tamilmirror.lk
+    adapter: google          # google only, 8h old
+    listings:
+      - https://www.tamilmirror.lk/breaking-news/150
+      - https://www.tamilmirror.lk/latest-news/151
+    selectors:
+      item: "article, .news-item"
+      link: "a"
+      title: "h2, h3, .title"
+      image: "img"
+
+  # ------------------------------------------------ added, from lk_news's list
+  # These are outlets nuuuwan's dataset covers that we had missed. BBC in
+  # particular is worth having: it publishes proper feeds in both Sinhala and
+  # Tamil, which is exactly where local outlets are weakest. lk_news scrapes
+  # BBC Sinhala's HTML instead and currently gets nothing from it.
+
+  - id: bbc-sinhala
+    name: BBC Sinhala
+    lang: si
+    site: https://www.bbc.com/sinhala
+    adapter: rss             # CONFIRMED: 10 items, 6h old
+    feeds:
+      - https://feeds.bbci.co.uk/sinhala/rss.xml
+
+  - id: bbc-tamil
+    name: BBC Tamil
+    lang: ta
+    site: https://www.bbc.com/tamil
+    adapter: rss             # CONFIRMED: 10 items, 0h old — best Tamil source
+    feeds:
+      - https://feeds.bbci.co.uk/tamil/rss.xml
+
+  - id: ada-lk
+    name: Ada.lk
+    lang: si
+    site: https://www.ada.lk
+    adapter: google
+    enabled: false        # not indexed by Google News; needs selectors
+                          # re-enable: probe.py --id ada-lk --diagnose
+
+  - id: island
+    name: The Island
+    lang: en
+    site: https://island.lk
+    adapter: google          # google only, 4h old
+
+  - id: ceylon-today
+    name: Ceylon Today
+    lang: en
+    site: https://ceylontoday.lk
+    adapter: google
+    enabled: false        # 403s us; Google has ~2 stale articles
+
+  - id: colombo-telegraph
+    name: Colombo Telegraph
+    lang: en
+    site: https://www.colombotelegraph.com
+    adapter: google          # google only, 34h old
+
+  - id: newsfirst-ta
+    name: NewsFirst Tamil
+    lang: ta
+    site: https://tamil.newsfirst.lk
+    adapter: google          # google only, 28h old
+
+  - id: newsfirst-si
+    name: NewsFirst Sinhala
+    lang: si
+    site: https://sinhala.newsfirst.lk
+    adapter: google
+    enabled: false        # not indexed by Google News; needs selectors
+                          # re-enable: probe.py --id newsfirst-si --diagnose
+
