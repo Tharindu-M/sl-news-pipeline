@@ -553,22 +553,46 @@ def from_html(client: httpx.Client, src: dict, limit: int = 40) -> list[Article]
 GOOGLE_HL = {"en": "en-LK", "si": "si", "ta": "ta"}
 
 
-def from_google_news(client: httpx.Client, src: dict, limit: int = 40) -> list[Article]:
-    """Adapter 5: last resort. Never pin this if a direct adapter works."""
+def _google_feed_url(query: str, hl: str, gl: str, ceid: str) -> str:
+    return ("https://news.google.com/rss/search"
+            f"?q={quote_plus(query)}&hl={hl}&gl={gl}&ceid={ceid}")
+
+
+def _google_variants(src: dict) -> list[str]:
+    """
+    Query forms to try, best first.
+
+    A single `site:x when:7d` with hl=si&gl=LK returns almost nothing for
+    Sinhala outlets — Ada Derana English yields 40 results this way while
+    Ada Derana Sinhala yields 1. Dropping the recency filter and retrying in
+    the regional edition Google actually serves recovers most of them.
+    """
     domain = urlparse(src["site"]).netloc.lower().removeprefix("www.")
-    hl = GOOGLE_HL.get(src["lang"], "en-LK")
-    query = src.get("google_query") or f"site:{domain}"
-    url = (
-        "https://news.google.com/rss/search"
-        f"?q={quote_plus(query + ' when:7d')}&hl={hl}&gl=LK&ceid=LK:{src['lang']}"
-    )
+    lang = src["lang"]
+    hl = GOOGLE_HL.get(lang, "en-LK")
+    base = src.get("google_query") or f"site:{domain}"
 
-    r = get(client, url)
-    if r is None:
-        return []
+    variants = [
+        (f"{base} when:7d", hl, "LK", f"LK:{lang}"),
+        (base, hl, "LK", f"LK:{lang}"),
+        (base, "en-US", "US", "US:en"),
+    ]
+    # Tamil content is largely indexed under the Indian edition; Google
+    # redirects LK:ta there anyway, so ask for it directly.
+    if lang == "ta":
+        variants.insert(2, (base, "ta", "IN", "IN:ta"))
+    # Some outlets publish a language section under the parent domain.
+    parent = ".".join(domain.split(".")[-2:])
+    if parent != domain and not src.get("google_query"):
+        variants.append((f"site:{parent} {lang}", hl, "LK", f"LK:{lang}"))
 
+    return [_google_feed_url(q, h, g, c) for q, h, g, c in variants]
+
+
+def _parse_google_feed(content: bytes, src: dict, domain: str,
+                       limit: int) -> list[Article]:
     out: list[Article] = []
-    for e in feedparser.parse(r.content).entries[:limit]:
+    for e in feedparser.parse(content).entries[:limit]:
         link, title = e.get("link"), (e.get("title") or "").strip()
         if not link or not title:
             continue
@@ -590,91 +614,26 @@ def from_google_news(client: httpx.Client, src: dict, limit: int = 40) -> list[A
     return out
 
 
-GOOGLE_HOSTS = ("news.google.com", "consent.google.com")
-
-# Payload skeleton for Google's internal batchexecute endpoint. This is the
-# only reliable way to turn a modern opaque article id (AU_yqL...) into a
-# publisher URL, and unlike following the redirect it is not affected by the
-# EU/UK consent interstitial.
-_GARTURL_ARGS = [
-    "garturlreq",
-    [["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1,
-      None, None, None, None, None, 0, 1],
-     "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0],
-]
-
-
-def _parse_batchexecute(text: str) -> str | None:
-    """Pull the resolved URL out of a batchexecute response body."""
-    for line in text.splitlines():
-        if "garturlres" not in line:
-            continue
-        try:
-            outer = json.loads(line)
-        except ValueError:
-            continue
-        for part in outer if isinstance(outer, list) else []:
-            if not (isinstance(part, list) and len(part) > 2):
-                continue
-            try:
-                inner = json.loads(part[2])
-            except (ValueError, TypeError):
-                continue
-            if isinstance(inner, list) and len(inner) > 1 and isinstance(inner[1], str):
-                if inner[1].startswith("http"):
-                    return inner[1]
-    return None
-
-
-def _decode_via_batchexecute(client: httpx.Client, url: str) -> str | None:
-    """Strategy 1: ask Google's own endpoint what the article id points to."""
-    r = get(client, url, quiet=True)
-    if r is None:
-        return None
-    soup = BeautifulSoup(r.text, "lxml")
-    node = soup.select_one("c-wiz > div") or soup.select_one("[data-n-a-sg]")
-    if node is None:
-        return None
-    sig, ts = node.get("data-n-a-sg"), node.get("data-n-a-ts")
-    aid = node.get("data-n-a-id") or url.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
-    if not (sig and ts):
-        return None
-
-    payload = [[["Fbv4je", json.dumps(_GARTURL_ARGS + [aid, ts, sig]), None, "generic"]]]
-    try:
-        resp = client.post(
-            "https://news.google.com/_/DotsSplashUi/data/batchexecute",
-            data={"f.req": json.dumps(payload)},
-            headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
-        )
-        resp.raise_for_status()
-    except httpx.HTTPError as e:
-        log.debug("batchexecute failed: %s", e)
-        return None
-    return _parse_batchexecute(resp.text)
-
-
-def _clear_consent(client: httpx.Client, resp: httpx.Response) -> bool:
+def from_google_news(client: httpx.Client, src: dict, limit: int = 40) -> list[Article]:
     """
-    Strategy 2 prerequisite: submit Google's consent form once.
+    Adapter 5: last resort. Never pin this if a direct adapter works.
 
-    From an EU/UK IP every redirect lands on consent.google.com. Posting the
-    form's hidden fields sets the cookies for the rest of the session.
+    Tries several query forms and keeps the most productive, because a single
+    form silently returns near-zero for some outlets.
     """
-    soup = BeautifulSoup(resp.text, "lxml")
-    form = soup.find("form")
-    if form is None:
-        return False
-    action = form.get("action") or "https://consent.google.com/save"
-    fields = {i.get("name"): i.get("value", "")
-              for i in form.find_all("input") if i.get("name")}
-    if not fields:
-        return False
-    try:
-        client.post(urljoin(str(resp.url), action), data=fields)
-        return True
-    except httpx.HTTPError:
-        return False
+    domain = urlparse(src["site"]).netloc.lower().removeprefix("www.")
+    best: list[Article] = []
+    for url in _google_variants(src):
+        r = get(client, url, quiet=True)
+        if r is None:
+            continue
+        items = _parse_google_feed(r.content, src, domain, limit)
+        if len(items) > len(best):
+            best = items
+        # Good enough — stop paying for more requests.
+        if len(best) >= min(limit, 20):
+            break
+    return best
 
 
 def resolve_google_url(

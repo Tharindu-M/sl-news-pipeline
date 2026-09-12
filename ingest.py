@@ -101,10 +101,19 @@ def fetch_source(client, src: dict, max_items: int) -> tuple[str, list[Article],
             items = ADAPTERS["google"](client, src, limit=max_items)
         except Exception:
             items = []
-        if items:
+        MIN_USEFUL = 3
+        if len(items) >= MIN_USEFUL:
             return src["id"], items, {
                 "ok": True, "error": None, "used_fallback": "google",
                 "primary_error": f"0 articles ({detail})",
+            }
+        if items:
+            # Better than nothing, but don't let it look healthy.
+            return src["id"], items, {
+                "ok": False, "used_fallback": "google",
+                "primary_error": f"0 articles ({detail})",
+                "error": f"primary blocked and google returned only "
+                         f"{len(items)} article(s)",
             }
 
     return src["id"], [], {"ok": False, "error": f"0 articles ({detail})"}
@@ -161,6 +170,7 @@ def main() -> int:
             }
             if not outcome["ok"]:
                 log.warning("%-20s FAILED  %s", sid, outcome["error"])
+                fresh.extend(items)   # keep whatever little we did get
             elif outcome.get("used_fallback"):
                 log.warning("%-20s %3d articles via GOOGLE FALLBACK (%s)",
                             sid, len(items), outcome["primary_error"][:70])
