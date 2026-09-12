@@ -26,47 +26,43 @@ jobs:
           FEED_BASE: ${{ vars.FEED_BASE }}   # e.g. https://user.github.io/repo
         run: |
           set -euo pipefail
-          curl -fsS "$FEED_BASE/v1/status.json" -o status.json
+          : "${FEED_BASE:?Set the FEED_BASE repository variable to your Pages base URL}"
+          curl --max-time 30 -fsS "$FEED_BASE/v1/status.json" -o status.json
 
           # Every feed must exist and be non-empty. Borrowed from
           # KOTTAGENVH's scraper_check.yaml, which asserts the same per source.
           for lang in en si ta; do
-            curl -fsS "$FEED_BASE/v1/feed_$lang.json" \
-              | jq -e '.articles | length > 0' > /dev/null \
+            curl --max-time 30 -fsS "$FEED_BASE/v1/feed_$lang.json" -o "feed_$lang.json"
+            jq -e '.articles | length > 0' "feed_$lang.json" > /dev/null \
               || { echo "::error::feed_$lang.json is empty or missing"; exit 1; }
+            generated=$(jq -r '.generated' "feed_$lang.json")
+            age=$(date -d "$generated" +%s)
+            seconds=$(( $(date +%s) - age ))
+            if [ "$seconds" -gt 21600 ] || [ "$seconds" -lt -300 ]; then
+              echo "::error::feed_$lang.json has a stale or future generation time"
+              exit 1
+            fi
           done
 
-          # Feeds must be fresh. A frozen pipeline that still serves 200s is
-          # exactly how brief.lk looked for seven weeks.
-          age=$(curl -fsS "$FEED_BASE/v1/feed_en.json" \
-            | jq -r '.generated' \
-            | xargs -I{} date -d {} +%s)
-          now=$(date +%s)
-          hours=$(( (now - age) / 3600 ))
-          echo "Feeds generated ${hours}h ago"
-          if [ "$hours" -gt 6 ]; then
-            echo "::error::Feeds are ${hours}h stale — the ingest job is not running"
-            exit 1
-          fi
-
-          {
-            echo "dead<<EOF"
-            jq -r '.dead[]?' status.json
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          echo "All language snapshots are non-empty and recently generated."
 
       - name: Report dead sources
         if: always()
         uses: actions/github-script@v7
+        env:
+          FETCH_OUTCOME: ${{ steps.status.outcome }}
         with:
           script: |
             const fs = require('fs');
-            let s;
+            let s = {};
             try { s = JSON.parse(fs.readFileSync('status.json', 'utf8')); }
-            catch { core.setFailed('Could not read status.json'); return; }
+            catch { core.warning('Could not read status.json'); }
 
             const dead = s.dead || [];
             const fallback = s.on_fallback || [];
+            const stale = s.stale_sources || [];
+            const google = s.google_sources || [];
+            const fetchFailed = process.env.FETCH_OUTCOME !== 'success';
             const title = 'News source problems';
             const { data: issues } = await github.rest.issues.listForRepo({
               owner: context.repo.owner, repo: context.repo.repo,
@@ -74,7 +70,8 @@ jobs:
             });
             const existing = issues.find(i => i.title === title);
 
-            if (dead.length === 0 && fallback.length === 0) {
+            if (!fetchFailed && dead.length === 0 && fallback.length === 0
+                && stale.length === 0 && google.length === 0) {
               if (existing) {
                 await github.rest.issues.update({
                   owner: context.repo.owner, repo: context.repo.repo,
@@ -86,20 +83,25 @@ jobs:
             }
 
             const rows = dead.map(id => {
-              const d = s.detail[id] || {};
+              const d = (s.detail || {})[id] || {};
               const h = d.hours_since_ok == null ? 'never' : `${d.hours_since_ok}h`;
               return `| \`${id}\` | ${d.lang || '?'} | ${d.adapter || '?'} | ${h} | ${d.error || '0 articles'} |`;
             }).join('\n');
 
             const fbRows = fallback.map(id => {
-              const d = s.detail[id] || {};
+              const d = (s.detail || {})[id] || {};
               return `| \`${id}\` | ${d.lang || '?'} | ${d.adapter || '?'} | ${(d.primary_error || '').slice(0, 90)} |`;
             }).join('\n');
 
             const body = [
+              ...(fetchFailed ? [
+                '**Live feed validation failed.** Check the health-check run logs; do not treat this snapshot as current.',
+                '',
+              ] : []),
               dead.length
                 ? `${dead.length} of ${s.sources_total} sources are dead (>48h).`
-                : `All sources are returning articles.`,
+                : (fetchFailed ? 'Current source health could not be verified.'
+                               : 'No dead sources reported in the accepted snapshot.'),
               '',
               ...(dead.length ? [
                 '| source | lang | adapter | silent for | error |',
@@ -108,13 +110,25 @@ jobs:
                 '',
               ] : []),
               ...(fallback.length ? [
-                `### ${fallback.length} source(s) running on the Google fallback`,
-                'These still produce articles, but via Google News: staler, no',
-                'images until enrichment, and dependent on a private endpoint.',
+                `### ${fallback.length} source(s) running on a fallback adapter`,
                 '',
                 '| source | lang | intended adapter | why the primary failed |',
                 '|---|---|---|---|',
                 fbRows,
+                '',
+              ] : []),
+              ...(stale.length ? [
+                '### Stale or unverified publication dates',
+                ...stale.map(id => {
+                  const d = (s.detail || {})[id] || {};
+                  return `- \`${id}\`: newest publication age ${d.hours_since_publication ?? 'unknown'}h; ${d.new_articles ?? 0} newly observed articles.`;
+                }),
+                '',
+              ] : []),
+              ...(google.length ? [
+                '### Google News dependency',
+                'Includes sources explicitly configured for Google, not just automatic fallbacks.',
+                ...google.map(id => `- \`${id}\``),
                 '',
               ] : []),
               'Fix: `python probe.py --id <source>` to find a working adapter,',

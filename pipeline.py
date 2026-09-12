@@ -9,6 +9,7 @@ knows about output formats or scheduling — ingest.py owns that.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import re
@@ -66,8 +67,9 @@ class Article:
     source_domain: str | None = None
     # True when `published` is the scrape time rather than the publisher's.
     # Listing pages rarely carry a date; enrich() repairs these from
-    # og:article:published_time. Never serialised.
+    # og:article:published_time. Clients must not display this as a verified date.
     date_estimated: bool = False
+    collected_at: str | None = None  # first observed in retained history, UTC
     # Optional CSS selector for the date on this source's article pages, from
     # `selectors.article_date` in sources.yaml. Never serialised.
     date_selector: str | None = None
@@ -80,12 +82,45 @@ class Article:
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items()
                 if v is not None
-                and k not in ("source_domain", "date_estimated",
+                and k not in ("source_domain",
                               "date_selector", "stale")}
 
     @property
     def published_dt(self) -> datetime:
         return dateparser.parse(self.published)
+
+
+def valid_web_url(url: str, allowed_hosts: Iterable[str] | None = None) -> bool:
+    """Validate scheme and host, rejecting credentials and non-public IP literals.
+
+    Host allowlists are exact (apart from www), not substring matches. This
+    does not replace network-level protections against DNS rebinding.
+    """
+    try:
+        if not isinstance(url, str) or re.search(r"[\s\\\x00-\x1f\x7f]", url):
+            return False
+        p = urlparse(url)
+        host = (p.hostname or "").lower().rstrip(".")
+        if (p.scheme not in ("http", "https") or not host
+                or p.username is not None or p.password is not None
+                or p.port not in (None, 80, 443)):
+            return False
+        try:
+            if not ipaddress.ip_address(host).is_global:
+                return False
+        except ValueError:
+            if "." not in host or host.endswith((".localhost", ".local", ".internal")):
+                return False
+        if allowed_hosts is not None:
+            allowed = {h.lower().rstrip(".").removeprefix("www.") for h in allowed_hosts}
+            return host.removeprefix("www.") in allowed
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def is_google_news(url: str) -> bool:
+    return valid_web_url(url, ("news.google.com",))
 
 
 def canonical_url(url: str, base: str | None = None) -> str:
@@ -97,6 +132,8 @@ def canonical_url(url: str, base: str | None = None) -> str:
     """
     if base:
         url = urljoin(base, url)
+    if not valid_web_url(url):
+        raise ValueError("Invalid HTTP(S) article URL")
     p = urlparse(url.strip())
     kept = [(k, v) for k, v in parse_qsl(p.query) if k.lower() not in JUNK_PARAMS]
     return urlunparse((
@@ -123,9 +160,8 @@ def clean_text(html_or_text: str | None, limit: int = 220) -> str | None:
     """
     Strip markup and collapse whitespace, then truncate.
 
-    We keep excerpts short on purpose. Republishing a publisher's full text
-    turns an aggregator into a competitor and is how you get a takedown.
-    Headline plus ~200 chars plus a link is the normal, defensible shape.
+    Short excerpts are a product choice, not a content licence. Publisher
+    terms and permissions still apply to headlines, excerpts and images.
     """
     if not html_or_text:
         return None
@@ -214,7 +250,7 @@ def parse_local_date(text: str) -> datetime | None:
         return None
 
 
-def to_iso(value: Any) -> str | None:
+def to_iso(value: Any, naive_tz=timezone(timedelta(hours=5, minutes=30))) -> str | None:
     """Normalize any timestamp to ISO-8601 UTC. Rejects absurd dates."""
     if value is None:
         return None
@@ -231,7 +267,7 @@ def to_iso(value: Any) -> str | None:
         return None
     if dt.tzinfo is None:
         # Sri Lanka Standard Time. Naive timestamps from .lk sites are local.
-        dt = dt.replace(tzinfo=timezone(timedelta(hours=5, minutes=30)))
+        dt = dt.replace(tzinfo=naive_tz)
     dt = dt.astimezone(timezone.utc)
 
     now = datetime.now(timezone.utc)
@@ -282,8 +318,26 @@ def _throttle_google(url: str) -> None:
         _google_last = time.monotonic()
 
 
+def checked_get(client: httpx.Client, url: str,
+                allowed_hosts: Iterable[str] | None = None) -> httpx.Response:
+    """Validate every redirect BEFORE issuing the next request."""
+    for _ in range(6):
+        if not valid_web_url(url, allowed_hosts):
+            raise httpx.RequestError("Rejected unsafe or unexpected URL")
+        _throttle_google(url)
+        response = client.get(url, follow_redirects=False)
+        if response.status_code not in (301, 302, 303, 307, 308):
+            return response
+        location = response.headers.get("location")
+        if not location:
+            return response
+        url = urljoin(url, location)
+    raise httpx.TooManyRedirects("Too many redirects")
+
+
 def get(client: httpx.Client, url: str, quiet: bool = False,
-        attempts: int = 3) -> httpx.Response | None:
+        attempts: int = 3,
+        allowed_hosts: Iterable[str] | None = None) -> httpx.Response | None:
     """
     Fetch a URL, or None. Failures here are expected and non-fatal: a source
     can be down, rate-limiting us, or serving a bot challenge.
@@ -294,8 +348,7 @@ def get(client: httpx.Client, url: str, quiet: bool = False,
     last = ""
     for attempt in range(attempts):
         try:
-            _throttle_google(url)
-            r = client.get(url)
+            r = checked_get(client, url, allowed_hosts)
             if r.status_code in RETRY_STATUSES and attempt < attempts - 1:
                 last = f"HTTP {r.status_code}"
                 time.sleep(1.5 * (attempt + 1))
@@ -353,6 +406,8 @@ def from_rss(client: httpx.Client, src: dict, limit: int = 40) -> list[Article]:
                     image = enc.get("href")
                     break
 
+        if not valid_web_url(urljoin(src["site"], link)):
+            continue
         url = canonical_url(link, src["site"])
         out.append(Article(
             id=article_id(url),
@@ -395,7 +450,8 @@ def from_wordpress(client: httpx.Client, src: dict, limit: int = 40) -> list[Art
         title = clean_text((p.get("title") or {}).get("rendered"), limit=300)
         if not link or not title:
             continue
-        published = to_iso(p.get("date_gmt") or p.get("date"))
+        published = (to_iso(p.get("date_gmt"), naive_tz=timezone.utc)
+                     or to_iso(p.get("date")))
         if not published:
             continue
 
@@ -404,6 +460,8 @@ def from_wordpress(client: httpx.Client, src: dict, limit: int = 40) -> list[Art
         if embedded and isinstance(embedded[0], dict):
             image = embedded[0].get("source_url")
 
+        if not valid_web_url(urljoin(src["site"], link)):
+            continue
         url = canonical_url(link, src["site"])
         out.append(Article(
             id=article_id(url),
@@ -479,7 +537,10 @@ def from_sitemap(client: httpx.Client, src: dict, limit: int = 40) -> list[Artic
             if not title or not published:
                 continue
 
-            url = canonical_url(loc.get_text(strip=True), src["site"])
+            link = urljoin(src["site"], loc.get_text(strip=True))
+            if not valid_web_url(link):
+                continue
+            url = canonical_url(link)
             out.append(Article(
                 id=article_id(url),
                 source_id=src["id"],
@@ -522,6 +583,8 @@ def from_html(client: httpx.Client, src: dict, limit: int = 40) -> list[Article]
         a = node.select_one(sel.get("link", "a"))
         href = a.get("href") if a else None
         if not href:
+            continue
+        if not valid_web_url(urljoin(src["site"], href)):
             continue
         url = canonical_url(href, src["site"])
         if url in seen:
@@ -615,7 +678,7 @@ def _parse_google_feed(content: bytes, src: dict, domain: str,
     out: list[Article] = []
     for e in feedparser.parse(content).entries[:limit]:
         link, title = e.get("link"), (e.get("title") or "").strip()
-        if not link or not title:
+        if not link or not title or not is_google_news(link):
             continue
         # Google appends " - Publisher" to every headline.
         title = re.sub(r"\s+-\s+[^-]{2,40}$", "", title).strip()
@@ -696,7 +759,7 @@ def _parse_batchexecute(text: str) -> str | None:
 
 def _decode_via_batchexecute(client: httpx.Client, url: str) -> str | None:
     """Strategy 1: ask Google's own endpoint what the article id points to."""
-    r = get(client, url, quiet=True)
+    r = get(client, url, quiet=True, allowed_hosts=GOOGLE_HOSTS)
     if r is None:
         return None
     soup = BeautifulSoup(r.text, "lxml")
@@ -715,6 +778,7 @@ def _decode_via_batchexecute(client: httpx.Client, url: str) -> str | None:
             "https://news.google.com/_/DotsSplashUi/data/batchexecute",
             data={"f.req": json.dumps(payload)},
             headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
+            follow_redirects=False,
         )
         resp.raise_for_status()
     except httpx.HTTPError as e:
@@ -735,13 +799,16 @@ def _clear_consent(client: httpx.Client, resp: httpx.Response) -> bool:
     if form is None:
         return False
     action = form.get("action") or "https://consent.google.com/save"
+    target = urljoin(str(resp.url), action)
+    if not valid_web_url(target, ("consent.google.com",)):
+        return False
     fields = {i.get("name"): i.get("value", "")
               for i in form.find_all("input") if i.get("name")}
     if not fields:
         return False
     try:
-        client.post(urljoin(str(resp.url), action), data=fields)
-        return True
+        response = client.post(target, data=fields, follow_redirects=False)
+        return response.status_code < 400
     except httpx.HTTPError:
         return False
 
@@ -756,30 +823,35 @@ def resolve_google_url(
     fetch the same page twice. Falls back to the Google link, which still
     redirects correctly in a real browser even when it fails for us.
     """
-    if "news.google.com" not in url:
+    if not is_google_news(url):
+        return url, None
+    if not expect_domain:
         return url, None
 
     decoded = _decode_via_batchexecute(client, url)
-    if decoded and (not expect_domain or expect_domain in urlparse(decoded).netloc):
+    if decoded and valid_web_url(decoded, (expect_domain,)):
         return canonical_url(decoded), None
 
     # Strategy 2: follow the redirect, clearing the consent wall if we hit it.
     for attempt in (1, 2):
         try:
-            r = client.get(url)
+            r = checked_get(client, url, (*GOOGLE_HOSTS, expect_domain))
+            r.raise_for_status()
         except httpx.HTTPError:
             return url, None
-        host = urlparse(str(r.url)).netloc
-        if not any(h in host for h in GOOGLE_HOSTS):
+        host = urlparse(str(r.url)).hostname
+        if valid_web_url(str(r.url), (expect_domain,)):
             return canonical_url(str(r.url)), r
-        if "consent.google.com" in host and attempt == 1 and _clear_consent(client, r):
+        if host == "consent.google.com" and attempt == 1 and _clear_consent(client, r):
             continue
         if expect_domain:
             m = re.search(
                 rf'https?://[^"\'\s<>\\]*{re.escape(expect_domain)}[^"\'\s<>\\]*',
                 r.text[:200_000], re.I)
             if m:
-                return canonical_url(m.group(0).replace("&amp;", "&")), None
+                candidate = m.group(0).replace("&amp;", "&")
+                if valid_web_url(candidate, (expect_domain,)):
+                    return canonical_url(candidate), None
         break
     return url, None
 
@@ -864,16 +936,19 @@ def enrich(client: httpx.Client, art: Article) -> Article:
     list of links.
     """
     r = None
-    if "news.google.com" in art.url:
+    if is_google_news(art.url):
         # The publisher's own domain, derived from the source registry.
         expect = art.source_domain or ""
         resolved, r = resolve_google_url(client, art.url, expect)
         if resolved != art.url:
             art.url = resolved
             art.id = article_id(resolved)
+        if is_google_news(art.url):
+            return art  # never use Google's page metadata as publisher content
 
     if r is None:
-        r = get(client, art.url, quiet=True)
+        host = art.source_domain or urlparse(art.url).hostname
+        r = get(client, art.url, quiet=True, allowed_hosts=(host,) if host else ())
     if r is None:
         return art
     soup = BeautifulSoup(r.text, "lxml")
@@ -888,7 +963,9 @@ def enrich(client: httpx.Client, art: Article) -> Article:
     if not art.image:
         img = meta("og:image", "twitter:image", "twitter:image:src")
         if img:
-            art.image = urljoin(art.url, img)
+            candidate = urljoin(art.url, img)
+            if valid_web_url(candidate):
+                art.image = candidate
     if not art.excerpt:
         art.excerpt = clean_text(meta("og:description", "description"))
 
@@ -928,17 +1005,24 @@ def dedupe(articles: Iterable[Article]) -> list[Article]:
     republished under slightly different titles.
     """
     def quality(x: Article) -> tuple[int, int, int]:
-        """Higher is better: fresh beats cached, real date beats estimated,
+        """Higher is better: real date beats estimated, then fresh beats cached,
         then richer metadata."""
         return (
-            0 if x.stale else 1,
             0 if x.date_estimated else 1,
+            0 if x.stale else 1,
             sum(bool(v) for v in (x.image, x.excerpt, x.category)),
         )
 
     by_id: dict[str, Article] = {}
     for a in articles:
         existing = by_id.get(a.id)
+        if existing:
+            first_seen = min(v for v in (
+                existing.collected_at or existing.published,
+                a.collected_at or a.published))
+            existing.collected_at = a.collected_at = first_seen
+            if existing.date_estimated and a.date_estimated:
+                existing.published = a.published = min(existing.published, a.published)
         if existing is None or quality(a) > quality(existing):
             by_id[a.id] = a
 

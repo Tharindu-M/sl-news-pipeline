@@ -20,6 +20,7 @@ def fake(client, src, limit=40):
 for k in pipeline.ADAPTERS: pipeline.ADAPTERS[k] = fake
 ingest.ADAPTERS = pipeline.ADAPTERS
 ingest.enrich = lambda c,a: a
+ingest.diagnose_endpoint = lambda c, s: {"error": "mock source unavailable"}
 
 cfg = """
 defaults: {timeout: 5, max_items: 10}
