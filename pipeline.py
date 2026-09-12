@@ -711,6 +711,59 @@ ADAPTERS = {
 }
 
 
+def primary_endpoint(client: httpx.Client, src: dict) -> str:
+    """The single URL this source depends on, for diagnostics."""
+    adapter = src.get("adapter", "rss")
+    if adapter == "rss":
+        feeds = src.get("feeds") or ([src["feed"]] if src.get("feed") else [])
+        return feeds[0] if feeds else src["site"]
+    if adapter == "wordpress":
+        return f"{src['site'].rstrip('/')}/wp-json/wp/v2/posts?per_page=1"
+    if adapter == "sitemap":
+        return src.get("sitemap") or discover_sitemaps(client, src["site"])[0]
+    if adapter == "html":
+        return (src.get("listings") or [src.get("listing") or src["site"]])[0]
+    domain = urlparse(src["site"]).netloc.lower().removeprefix("www.")
+    hl = GOOGLE_HL.get(src["lang"], "en-LK")
+    return ("https://news.google.com/rss/search"
+            f"?q={quote_plus('site:' + domain)}&hl={hl}&gl=LK&ceid=LK:{src['lang']}")
+
+
+def diagnose_endpoint(client: httpx.Client, src: dict) -> dict[str, Any]:
+    """
+    Why did this source return nothing?
+
+    "0 articles" is useless in a CI log — a 403 from bot protection, a 404
+    from a moved endpoint and a timeout all need different fixes, and the
+    answer can differ between a home connection and a datacentre IP.
+    """
+    try:
+        url = primary_endpoint(client, src)
+    except Exception as e:
+        return {"error": f"could not build endpoint: {e}"}
+    info: dict[str, Any] = {"endpoint": url}
+    try:
+        r = client.get(url)
+        info.update(
+            status=r.status_code,
+            server=r.headers.get("server", "")[:40],
+            content_type=r.headers.get("content-type", "").split(";")[0],
+            bytes=len(r.content),
+            final_url=str(r.url)[:160] if str(r.url) != url else None,
+        )
+        if r.status_code in (403, 503) and "cloudflare" in info["server"].lower():
+            info["hint"] = "Cloudflare is blocking this IP"
+        elif r.status_code == 404:
+            info["hint"] = "endpoint moved — re-run probe.py"
+        elif r.status_code == 200 and info["bytes"] < 500:
+            info["hint"] = "200 but almost empty — likely a challenge page"
+        elif r.status_code == 200:
+            info["hint"] = "200 with content — our parser is the problem"
+    except httpx.HTTPError as e:
+        info["exception"] = f"{type(e).__name__}: {str(e).splitlines()[0][:90]}"
+    return {k: v for k, v in info.items() if v is not None}
+
+
 # ---------------------------------------------------------------------------
 # Enrichment and dedupe
 # ---------------------------------------------------------------------------

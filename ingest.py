@@ -32,7 +32,8 @@ from pathlib import Path
 import yaml
 from dateutil import parser as dateparser
 
-from pipeline import ADAPTERS, Article, dedupe, enrich, make_client
+from pipeline import (ADAPTERS, Article, dedupe, diagnose_endpoint, enrich,
+                      make_client)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,7 +69,9 @@ def fetch_source(client, src: dict, max_items: int) -> tuple[str, list[Article],
     try:
         items = adapter(client, src, limit=max_items)
         if not items:
-            return src["id"], [], "0 articles"
+            d = diagnose_endpoint(client, src)
+            detail = " ".join(f"{k}={v}" for k, v in d.items() if k != "endpoint")
+            return src["id"], [], f"0 articles ({detail})"
         return src["id"], items, None
     except Exception as e:
         return src["id"], [], f"{type(e).__name__}: {e}"
