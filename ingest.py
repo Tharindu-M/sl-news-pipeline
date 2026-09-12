@@ -31,8 +31,8 @@ from pathlib import Path
 import yaml
 from dateutil import parser as dateparser
 
-from pipeline import (ADAPTERS, Article, dedupe, diagnose_endpoint, enrich,
-                      make_client)
+from pipeline import (ADAPTERS, ADAPTER_PREFERENCE, Article, dedupe,
+                      diagnose_endpoint, enrich, make_client)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,18 +61,28 @@ def load_previous(outdir: Path, lang: str) -> list[dict]:
         return []
 
 
+def _can_try(adapter: str, src: dict) -> bool:
+    """Whether a source has the config an adapter needs to run at all."""
+    if adapter == "rss":
+        return bool(src.get("feeds") or src.get("feed"))
+    if adapter == "html":
+        return bool(src.get("selectors"))
+    return True
+
+
 def fetch_source(client, src: dict, max_items: int) -> tuple[str, list[Article], dict]:
     """
-    Fetch one source, falling back to Google News if its own site refuses us.
+    Fetch one source, walking down the adapter ladder if its site refuses us.
 
-    This matters because a datacentre IP gets treated very differently from a
-    home connection: Ada Derana answers a UK browser but returns 403 from
-    CloudFront to a CI runner, and Divaina does the same via Cloudflare. Google
-    News reaches all of them, so a blocked source degrades to a slower, less
-    complete feed instead of disappearing.
+    A datacentre IP is treated very differently from a home connection: Ada
+    Derana answers a UK browser but returns 403 from CloudFront to a CI
+    runner, and Divaina does the same via Cloudflare. Those rules are usually
+    per-endpoint rather than per-domain, so a blocked /wp-json often sits
+    beside a perfectly open RSS feed — worth trying before resorting to Google.
 
-    The fallback is recorded, not silent — `status.json` shows which sources
-    are running on it so the primary adapter still gets fixed.
+    Any fallback is recorded rather than silent: status.json names the adapter
+    actually used and keeps the original error, so the primary still gets
+    fixed instead of quietly rotting behind a green tick.
     """
     name = src.get("adapter", "rss")
     adapter = ADAPTERS.get(name)
@@ -93,29 +103,34 @@ def fetch_source(client, src: dict, max_items: int) -> tuple[str, list[Article],
     detail = primary_err or " ".join(
         f"{k}={v}" for k, v in d.items() if k != "endpoint")
 
-    # Last resort: Google News indexes nearly every one of these outlets and
-    # is not IP-blocked from CI.
-    if name != "google" and src.get("fallback", True):
-        try:
-            items = ADAPTERS["google"](client, src, limit=max_items)
-        except Exception:
-            items = []
-        MIN_USEFUL = 3
-        if len(items) >= MIN_USEFUL:
-            return src["id"], items, {
-                "ok": True, "error": None, "used_fallback": "google",
-                "primary_error": f"0 articles ({detail})",
-            }
-        if items:
-            # Better than nothing, but don't let it look healthy.
-            return src["id"], items, {
-                "ok": False, "used_fallback": "google",
-                "primary_error": f"0 articles ({detail})",
-                "error": f"primary blocked and google returned only "
-                         f"{len(items)} article(s)",
-            }
+    used = None
+    if src.get("fallback", True):
+        for alt in ADAPTER_PREFERENCE:
+            if alt == name or not _can_try(alt, src):
+                continue
+            try:
+                items = ADAPTERS[alt](client, src, limit=max_items)
+            except Exception:
+                items = []
+            if items:
+                used = alt
+                break
 
-    return src["id"], [], {"ok": False, "error": f"0 articles ({detail})"}
+    if used is None:
+        return src["id"], [], {"ok": False, "error": f"0 articles ({detail})"}
+
+    # A fallback returning one or two articles is not a working source.
+    MIN_USEFUL = 3
+    if len(items) >= MIN_USEFUL:
+        return src["id"], items, {
+            "ok": True, "error": None, "used_fallback": used,
+            "primary_error": f"0 articles ({detail})",
+        }
+    return src["id"], items, {
+        "ok": False, "used_fallback": used,
+        "primary_error": f"0 articles ({detail})",
+        "error": f"primary blocked; {used} returned only {len(items)} article(s)",
+    }
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -171,8 +186,9 @@ def main() -> int:
                 log.warning("%-20s FAILED  %s", sid, outcome["error"])
                 fresh.extend(items)   # keep whatever little we did get
             elif outcome.get("used_fallback"):
-                log.warning("%-20s %3d articles via GOOGLE FALLBACK (%s)",
-                            sid, len(items), outcome["primary_error"][:70])
+                log.warning("%-20s %3d articles via %s fallback (%s)",
+                            sid, len(items), outcome["used_fallback"].upper(),
+                            outcome["primary_error"][:70])
                 fresh.extend(items)
             else:
                 log.info("%-20s %3d articles", sid, len(items))
@@ -313,8 +329,10 @@ def main() -> int:
         log.warning("dead >48h (%d): %s", len(dead), ", ".join(dead))
 
     if on_fallback:
-        log.warning("%d source(s) running on the Google fallback: %s",
-                    len(on_fallback), ", ".join(on_fallback))
+        log.warning("%d source(s) running on a fallback adapter: %s",
+                    len(on_fallback),
+                    ", ".join(f"{k}->{status[k]['used_fallback']}"
+                              for k in on_fallback))
     log.info("done: %d/%d sources healthy (%d on fallback)",
              ok, len(sources), len(on_fallback))
 

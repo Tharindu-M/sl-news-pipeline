@@ -268,7 +268,7 @@ RETRY_STATUSES = {202, 429, 500, 502, 503, 504}
 # a small gap so a burst can't get the whole run throttled.
 _google_lock = threading.Lock()
 _google_last = 0.0
-GOOGLE_MIN_GAP = 0.35
+GOOGLE_MIN_GAP = 0.2
 
 
 def _throttle_google(url: str) -> None:
