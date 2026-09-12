@@ -9,7 +9,7 @@ on:
   workflow_dispatch:        # lets you trigger a run by hand from the Actions tab
   push:
     branches: [main]
-    paths: ["sources.yaml", "pipeline.py", "ingest.py"]
+    paths: ["sources.yaml", "*.py", "requirements.txt", "tests/**", ".github/workflows/ingest.yml"]
 
 # Never let two runs write the feeds at once.
 concurrency:
@@ -23,6 +23,7 @@ permissions:
 
 jobs:
   ingest:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -47,6 +48,7 @@ jobs:
         run: |
           python tests/test_pipeline.py
           python tests/test_e2e.py
+          python -m unittest discover -s tests -p test_reliability.py
 
       # Pull down last run's output so ingest.py can merge rather than
       # rebuild from scratch. Without this, a source being briefly down
@@ -55,28 +57,24 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: public
-          key: feeds-${{ github.run_id }}
-          restore-keys: feeds-
+          key: accepted-feeds-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: accepted-feeds-v2-
 
       - name: Run ingestion
-        run: python ingest.py --out public
-
-      - name: Save feeds
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: public
-          key: feeds-${{ github.run_id }}
+        run: python ingest.py --out public --diagnostics diagnostics/status.json
 
       # Health summary lands on the Actions run page.
       - name: Report
         if: always()
         run: |
-          if [ -f public/v1/status.json ]; then
+          if [ -f diagnostics/status.json ]; then
             python - <<'PY' >> $GITHUB_STEP_SUMMARY
           import json
-          s = json.load(open("public/v1/status.json"))
+          s = json.load(open("diagnostics/status.json"))
           print(f"### {s['sources_ok']}/{s['sources_total']} sources healthy\n")
+          print(f"Accepted: {s['accepted']}; errors: {s['errors']}\n")
+          print(f"Stale content: {', '.join(s['stale_sources']) or 'none'}\n")
+          print(f"Google-dependent: {', '.join(s['google_sources']) or 'none'}\n")
           print(f"Articles: " + ", ".join(f"{k}={v}" for k, v in s["totals"].items()) + "\n")
           bad = [(k, v) for k, v in s["detail"].items() if not v["ok"]]
           if bad:
@@ -87,12 +85,28 @@ jobs:
           PY
           fi
 
+      - name: Upload run diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingestion-diagnostics-${{ github.run_attempt }}
+          path: diagnostics/status.json
+          if-no-files-found: ignore
+          retention-days: 7
+
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
           path: public
       - id: deployment
         uses: actions/deploy-pages@v4
+
+      # Never restore rejected or undeployed output on the next run.
+      - name: Save accepted feeds
+        uses: actions/cache/save@v4
+        with:
+          path: public
+          key: accepted-feeds-v2-${{ github.run_id }}-${{ github.run_attempt }}
 
     environment:
       name: github-pages

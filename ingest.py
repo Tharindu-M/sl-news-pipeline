@@ -24,15 +24,18 @@ import argparse
 import json
 import logging
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 from dateutil import parser as dateparser
 
 from pipeline import (ADAPTERS, ADAPTER_PREFERENCE, Article, dedupe,
-                      diagnose_endpoint, enrich, make_client)
+                      diagnose_endpoint, enrich, make_client, is_google_news,
+                      valid_web_url)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -143,6 +146,46 @@ def write_json(path: Path, payload: dict) -> None:
     tmp.replace(path)  # atomic — readers never see a half-written file
 
 
+def publish_snapshot(outdir: Path, payloads: dict[str, dict]) -> None:
+    """Stage a complete version and roll back if directory promotion fails.
+
+    Only one writer is supported. Pages deploys the accepted artifact as a
+    unit; direct local readers may see a brief gap during directory renames.
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".snapshot-", dir=outdir) as tmp:
+        staging = Path(tmp) / API_VERSION
+        for name, payload in payloads.items():
+            write_json(staging / name, payload)
+        target = outdir / API_VERSION
+        backup = Path(tmp) / "previous"
+        if target.exists():
+            target.rename(backup)
+        try:
+            staging.rename(target)
+        except OSError:
+            if backup.exists():
+                backup.rename(target)
+            raise
+
+
+def source_freshness(items: list[Article], previous: list[Article],
+                     now: datetime, max_age_hours: float) -> dict:
+    """Fetch success and publisher freshness are independent signals."""
+    known = {a.id for a in previous}
+    verified = [a.published_dt for a in dedupe(items + previous)
+                if not a.date_estimated and a.published_dt <= now]
+    newest = max(verified) if verified else None
+    hours = (now - newest).total_seconds() / 3600 if newest else None
+    return {
+        "new_articles": len({a.id for a in items} - known),
+        "newest_published": newest.isoformat().replace("+00:00", "Z") if newest else None,
+        "hours_since_publication": round(hours, 1) if hours is not None else None,
+        "stale_content": hours is None or hours > max_age_hours,
+        "estimated_dates": sum(a.date_estimated for a in items),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="public")
@@ -150,13 +193,18 @@ def main() -> int:
     ap.add_argument("--no-enrich", action="store_true",
                     help="skip per-article og:image fetches (much faster)")
     ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--diagnostics", default="diagnostics/status.json",
+                    help="latest run report, written separately from accepted feeds")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(open(args.config, encoding="utf-8"))
+    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     defaults = cfg.get("defaults", {})
     sources = [s for s in cfg["sources"] if s.get("enabled", True)]
     parked = len(cfg["sources"]) - len(sources)
     outdir = Path(args.out)
+    diagnostics = Path(args.diagnostics)
+    if diagnostics.resolve().is_relative_to(outdir.resolve()):
+        ap.error("--diagnostics must be outside --out")
     if parked:
         log.info("%d source(s) parked via `enabled: false`", parked)
 
@@ -194,22 +242,35 @@ def main() -> int:
                 log.info("%-20s %3d articles", sid, len(items))
                 fresh.extend(items)
 
-    if not fresh:
-        log.error("Every source failed. Refusing to overwrite good feeds with nothing.")
-        return 1
+    # Publisher content is untrusted, even when its listing endpoint is trusted.
+    registry = {s["id"]: s for s in sources}
+    validated = []
+    for art in fresh:
+        host = urlparse(registry[art.source_id]["site"]).hostname
+        if not (valid_web_url(art.url, (host,)) or is_google_news(art.url)):
+            log.warning("Rejected unexpected article URL for %s", art.source_id)
+            continue
+        art.source_domain = host
+        if art.image and not valid_web_url(art.image):
+            art.image = None
+        validated.append(art)
+    fresh = validated
+    collected = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    for art in fresh:
+        art.collected_at = collected
 
     # ---- fill in missing images -------------------------------------------
     if not args.no_enrich:
         # sitemap and google adapters return no image at all, so most of the
         # feed depends on this step. Prioritise the newest articles — those
         # are the ones users actually see.
-        google = [a for a in fresh if "news.google.com" in a.url]
+        google = [a for a in fresh if is_google_news(a.url)]
         # A fabricated date is worse than a missing image: it pins the source
         # to the top of the feed forever and shows users the wrong time.
         undated = [a for a in fresh
-                   if a.date_estimated and "news.google.com" not in a.url]
+                   if a.date_estimated and not is_google_news(a.url)]
         imageless = [a for a in fresh
-                     if "news.google.com" not in a.url
+                     if not is_google_news(a.url)
                      and not a.date_estimated and not a.image]
         needs = google + undated + sorted(
             imageless, key=lambda a: a.published, reverse=True)[:250]
@@ -219,7 +280,7 @@ def main() -> int:
         with ThreadPoolExecutor(max_workers=max(args.workers, 10)) as pool:
             list(pool.map(lambda a: enrich(client, a), needs))
         resolved = len(google) - sum(
-            1 for a in google if "news.google.com" in a.url)
+            1 for a in google if is_google_news(a.url))
         got_image = sum(1 for a in needs if a.image)
         still_estimated = sum(1 for a in fresh if a.date_estimated)
         log.info("enriched: %d/%d google links resolved, %d dates recovered, "
@@ -232,7 +293,8 @@ def main() -> int:
         # enrich() rewrites google redirect URLs, which changes article ids.
         fresh = dedupe(fresh)
 
-    google_total = sum(1 for a in fresh if a.source_id and "news.google.com" in a.url)
+    client.close()
+    google_total = sum(1 for a in fresh if is_google_news(a.url))
     if google_total:
         log.warning("%d article(s) still point at news.google.com "
                     "(consent wall or unresolvable id)", google_total)
@@ -241,6 +303,10 @@ def main() -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
     generated = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     totals: dict[str, int] = {}
+    payloads: dict[str, dict] = {}
+    previous_all: list[Article] = []
+    for art in fresh:
+        art.collected_at = art.collected_at or generated
 
     for lang in ("en", "si", "ta"):
         previous = [
@@ -249,41 +315,61 @@ def main() -> int:
                        if k in Article.__dataclass_fields__ and k != "stale"})
             for d in load_previous(outdir, lang)
         ]
+        previous = [
+            a for a in previous if a.source_id in registry
+            and (valid_web_url(a.url, (urlparse(registry[a.source_id]["site"]).hostname,))
+                 or is_google_news(a.url))
+        ]
+        previous_all.extend(previous)
+        for art in previous:
+            if art.image and not valid_web_url(art.image):
+                art.image = None
         combined = [a for a in fresh if a.lang == lang] + previous
         merged = [a for a in dedupe(combined) if a.published_dt >= cutoff]
         totals[lang] = len(merged)
 
-        write_json(outdir / API_VERSION / f"feed_{lang}.json", {
+        payloads[f"feed_{lang}.json"] = {
             "version": API_VERSION,
             "lang": lang,
             "generated": generated,
             "count": len(merged[:PER_FEED]),
             "articles": [a.to_dict() for a in merged[:PER_FEED]],
-        })
+        }
 
         for cat in CATEGORIES:
             subset = [a for a in merged if a.category == cat][:PER_FEED]
             if subset:
-                write_json(outdir / API_VERSION / f"feed_{lang}_{cat}.json", {
+                payloads[f"feed_{lang}_{cat}.json"] = {
                     "version": API_VERSION,
                     "lang": lang,
                     "category": cat,
                     "generated": generated,
                     "count": len(subset),
                     "articles": [a.to_dict() for a in subset],
-                })
+                }
 
         log.info("feed_%s.json  %d articles", lang, len(merged[:PER_FEED]))
 
-    write_json(outdir / API_VERSION / "sources.json", {
+    payloads["sources.json"] = {
         "version": API_VERSION,
         "generated": generated,
         "sources": [
             {"id": s["id"], "name": s["name"], "lang": s["lang"], "site": s["site"]}
             for s in sources
         ],
-    })
+    }
 
+    for sid, info in status.items():
+        items = [a for a in fresh if a.source_id == sid]
+        info["count"] = len(items)
+        if not items:
+            info["ok"] = False
+            info["error"] = info.get("error") or "No valid articles"
+        info.update(source_freshness(
+            items, [a for a in previous_all if a.source_id == sid],
+            dateparser.parse(generated),
+            registry[sid].get("max_age_hours", defaults.get("max_age_hours", 48)),
+        ))
     ok = sum(1 for v in status.values() if v["ok"])
     on_fallback = sorted(k for k, v in status.items() if v.get("used_fallback"))
     # Carry forward "last time this source produced anything", so a source
@@ -314,16 +400,23 @@ def main() -> int:
         if i["hours_since_ok"] is None or i["hours_since_ok"] > 48
     )
 
-    write_json(history_path, {
+    stale_sources = sorted(sid for sid, info in status.items() if info["stale_content"])
+    google_sources = sorted(
+        sid for sid, info in status.items()
+        if info.get("used_fallback", info["adapter"]) == "google"
+    )
+    report = {
         "generated": generated,
         "sources_ok": ok,
         "sources_total": len(sources),
         "totals": totals,
         "unresolved_google_links": google_total,
         "on_fallback": on_fallback,
+        "google_sources": google_sources,
+        "stale_sources": stale_sources,
         "dead": dead,
         "detail": status,
-    })
+    }
 
     if dead:
         log.warning("dead >48h (%d): %s", len(dead), ", ".join(dead))
@@ -355,14 +448,31 @@ def main() -> int:
     # Fail the CI job only when the output is genuinely unusable, so you find
     # out from a notification rather than from a user review — but a couple of
     # blocked sources running on the fallback is not a build failure.
+    errors = []
     empty_langs = [lang for lang, n in totals.items() if n == 0]
+    if not fresh:
+        errors.append("No valid articles fetched")
     if empty_langs:
         log.error("FAILING: no articles at all for %s", ", ".join(empty_langs))
-        return 1
+        errors.append(f"No retained articles for: {', '.join(empty_langs)}")
     if ok < len(sources) * 0.4:
         log.error("FAILING: only %d of %d sources produced articles. "
                   "See status.json `detail` for per-source errors.",
                   ok, len(sources))
+        errors.append(f"Only {ok}/{len(sources)} sources succeeded")
+    report["accepted"] = not errors
+    report["errors"] = errors
+    write_json(diagnostics, report)
+    if errors:
+        return 1
+    payloads["status.json"] = report
+    try:
+        publish_snapshot(outdir, payloads)
+    except OSError as exc:
+        report["accepted"] = False
+        report["errors"] = [f"Snapshot publication failed: {exc}"]
+        write_json(diagnostics, report)
+        log.exception("Could not promote staged snapshot")
         return 1
     if ok < len(sources):
         log.warning("%d of %d sources produced nothing — run continues",

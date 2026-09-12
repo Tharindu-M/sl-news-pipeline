@@ -50,7 +50,7 @@ class R:
     def raise_for_status(s): pass
 class C:
     def __init__(s, m): s.m = m
-    def get(s, url):
+    def get(s, url, **kwargs):
         for k, v in s.m.items():
             if k in url: return R(v)
         raise Exception("404 " + url)
@@ -190,7 +190,7 @@ check("non-google url passes through",
       == "https://www.divaina.lk/a/1")
 
 _FORM = '<html><form action="/save"><input name="x" value="1"></form></html>'
-check("clear_consent posts the form", _clear_consent(_GC(), _GR(_FORM)) is True)
+check("clear_consent posts the form", _clear_consent(_GC(), _GR(_FORM, "https://consent.google.com/m")) is True)
 check("clear_consent handles no form", _clear_consent(_GC(), _GR("<html></html>")) is False)
 
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILED: {fails}"))
