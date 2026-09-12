@@ -333,6 +333,22 @@ def main() -> int:
                     len(on_fallback),
                     ", ".join(f"{k}->{status[k]['used_fallback']}"
                               for k in on_fallback))
+    by_lang: dict[str, list[str]] = {}
+    for sid, info in status.items():
+        if info["ok"]:
+            by_lang.setdefault(info["lang"], []).append(sid)
+    for lang in ("en", "si", "ta"):
+        n = len(by_lang.get(lang, []))
+        total = sum(1 for x in sources if x["lang"] == lang)
+        log.info("  %s: %3d articles from %d/%d sources",
+                 lang, totals.get(lang, 0), n, total)
+
+    thin = [l for l in ("en", "si", "ta")
+            if totals.get(l, 0) < max(totals.values() or [0]) * 0.35]
+    if thin:
+        log.warning("thin coverage for %s — worth adding sources or "
+                    "unblocking the ones on a fallback", ", ".join(thin))
+
     log.info("done: %d/%d sources healthy (%d on fallback)",
              ok, len(sources), len(on_fallback))
 

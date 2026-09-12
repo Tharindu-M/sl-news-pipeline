@@ -126,9 +126,11 @@ sources:
     name: Mawbima
     lang: si
     site: https://www.mawbima.lk
-    adapter: google
-    enabled: false        # not indexed by Google News; needs selectors
-                          # re-enable: probe.py --id mawbima --diagnose
+    adapter: wordpress
+    feeds:
+      - https://www.mawbima.lk/feed
+      - https://www.mawbima.lk/rss.xml
+    # re-enabled: ladder now tries rss/sitemap/google before giving up
 
   # ------------------------------------------------------------------ Tamil
 
@@ -151,9 +153,11 @@ sources:
     name: Thinakkural
     lang: ta
     site: https://www.thinakkural.lk
-    adapter: google
-    enabled: false        # not indexed by Google News; needs selectors
-                          # re-enable: probe.py --id thinakkural --diagnose
+    adapter: wordpress
+    feeds:
+      - https://www.thinakkural.lk/feed
+      - https://www.thinakkural.lk/rss.xml
+    # re-enabled to widen thin Tamil coverage
 
   - id: tamil-mirror
     name: Tamil Mirror
@@ -197,9 +201,11 @@ sources:
     name: Ada.lk
     lang: si
     site: https://www.ada.lk
-    adapter: google
-    enabled: false        # not indexed by Google News; needs selectors
-                          # re-enable: probe.py --id ada-lk --diagnose
+    adapter: sitemap
+    feeds:
+      - https://www.ada.lk/rss.php
+      - https://www.ada.lk/feed
+    # lk_news gets ~87/week from this outlet, so it is worth retrying
 
   - id: island
     name: The Island
@@ -230,7 +236,9 @@ sources:
     name: NewsFirst Sinhala
     lang: si
     site: https://sinhala.newsfirst.lk
-    adapter: google
-    enabled: false        # not indexed by Google News; needs selectors
-                          # re-enable: probe.py --id newsfirst-si --diagnose
+    adapter: wordpress
+    feeds:
+      - https://sinhala.newsfirst.lk/feed
+      - https://sinhala.newsfirst.lk/rss.xml
+    # WordPress like its English and Tamil siblings
 
