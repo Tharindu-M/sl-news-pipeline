@@ -19,7 +19,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
 from typing import Any, Iterable
 from urllib.parse import (urljoin, urlparse, urlunparse, parse_qsl,
-                          urlencode, quote_plus)
+                          urlencode, quote, quote_plus, urlsplit, urlunsplit)
 
 import warnings
 
@@ -121,6 +121,34 @@ def valid_web_url(url: str, allowed_hosts: Iterable[str] | None = None) -> bool:
 
 def is_google_news(url: str) -> bool:
     return valid_web_url(url, ("news.google.com",))
+
+
+# A verified (non-estimated) publish time newer than this is what "usable"
+# means during adapter selection. This is a selection heuristic, separate
+# from the per-source `max_age_hours` used for reporting in ingest.py.
+FRESH_WINDOW_HOURS = 48
+
+
+def freshest_age_hours(items: Iterable["Article"]) -> float | None:
+    """Hours since the most recent *verified* publish time, or None.
+
+    Estimated (scrape-time) dates never count: they cannot prove an outlet
+    actually published anything recently.
+    """
+    now = datetime.now(timezone.utc)
+    ages = [(now - a.published_dt).total_seconds() / 3600
+            for a in items if not a.date_estimated]
+    return min(ages) if ages else None
+
+
+def count_fresh(items: Iterable["Article"], window_hours: float = FRESH_WINDOW_HOURS) -> int:
+    """How many items carry a verified publish time within the window."""
+    now = datetime.now(timezone.utc)
+    return sum(
+        1 for a in items
+        if not a.date_estimated
+        and (now - a.published_dt).total_seconds() / 3600 <= window_hours
+    )
 
 
 def canonical_url(url: str, base: str | None = None) -> str:
@@ -250,6 +278,50 @@ def parse_local_date(text: str) -> datetime | None:
         return None
 
 
+# "5 hours ago" on a listing page is a real publish time, but dateutil raises
+# on it, so it used to fall through to a fabricated scrape-time date. That is
+# the worst outcome available: the article is stamped "now", sorts above
+# genuinely newer stories, and shows readers a time that is hours wrong.
+# Lankadeepa shows this form for everything published in the last day and an
+# absolute date after that, so it was precisely the freshest half of its feed
+# that carried invented timestamps.
+RELATIVE_UNITS = {
+    "sec": 1, "second": 1, "min": 60, "minute": 60,
+    "hr": 3600, "hour": 3600, "day": 86400, "week": 604800,
+}
+
+# Requires "<count> <unit> ago" as whole words, so "Chicago" cannot match.
+RELATIVE_RE = re.compile(
+    r"\b(?:(\d{1,3})|(an?))\s+(sec|second|min|minute|hr|hour|day|week)s?\s+ago\b",
+    re.I)
+
+
+def parse_relative_date(text: str, now: datetime | None = None) -> datetime | None:
+    """
+    Parse an English relative timestamp ("5 hours ago") into an absolute UTC
+    datetime, or return None.
+
+    Always returns tz-aware UTC: a naive return would be re-interpreted by
+    to_iso() as Colombo local time and shifted a further 5h30m into the past.
+    """
+    if not text:
+        return None
+    now = now or datetime.now(timezone.utc)
+    low = str(text).strip().lower()
+
+    if low in ("just now", "moments ago", "a moment ago", "now"):
+        return now
+    if low == "yesterday":
+        return now - timedelta(days=1)
+
+    m = RELATIVE_RE.search(low)
+    if not m:
+        return None
+    count = int(m.group(1)) if m.group(1) else 1
+    seconds = RELATIVE_UNITS[m.group(3)] * count
+    return now - timedelta(seconds=seconds)
+
+
 def to_iso(value: Any, naive_tz=timezone(timedelta(hours=5, minutes=30))) -> str | None:
     """Normalize any timestamp to ISO-8601 UTC. Rejects absurd dates."""
     if value is None:
@@ -260,7 +332,9 @@ def to_iso(value: Any, naive_tz=timezone(timedelta(hours=5, minutes=30))) -> str
         elif isinstance(value, datetime):
             dt = value
         else:
-            dt = parse_local_date(str(value)) or dateparser.parse(str(value))
+            dt = (parse_local_date(str(value))
+                  or parse_relative_date(str(value))
+                  or dateparser.parse(str(value)))
     except (ValueError, TypeError, OverflowError):
         return None
     if dt is None:
@@ -477,6 +551,131 @@ def from_wordpress(client: httpx.Client, src: dict, limit: int = 40) -> list[Art
     return out
 
 
+def encode_url_path(url: str) -> str:
+    """
+    Percent-encode a URL a CMS emitted with raw spaces or brackets.
+
+    NewsFirst serves image paths straight off the filesystem, so names like
+    "New Project (2)-623751.jpg" arrive unencoded and fail valid_web_url().
+    Already-encoded triplets are preserved: `%` stays in the safe set so a
+    second pass cannot double-encode `%e0%b6%9a` into `%25e0%25b6%259a`.
+    """
+    s = urlsplit(url)
+    return urlunsplit((s.scheme, s.netloc, quote(s.path, safe="/%"),
+                       quote(s.query, safe="=&%"), ""))
+
+
+# Buckets whose meaning maps cleanly onto ingest.CATEGORIES. "local",
+# "featured", "sticky" and "latest" are placements rather than subjects, so
+# they stay uncategorised instead of being forced into a wrong bucket.
+NEWSFIRST_CATEGORIES = {
+    "sportPost": "sports",
+    "worldPost": "international",
+    "businessPost": "business",
+}
+
+
+def _newsfirst_posts(payload: Any) -> list[tuple[str, dict]]:
+    """
+    Flatten the API's nested envelope into (bucket, post) pairs.
+
+    The response is a dict of buckets; each bucket holds `postResponseDto`,
+    a list whose entries are *either* posts themselves or another
+    `{rowCount, postResponseDto}` wrapper. Both shapes occur in the same
+    response, so handle each entry on its own rather than assuming one.
+    """
+    out: list[tuple[str, dict]] = []
+    if not isinstance(payload, dict):
+        return out
+    for bucket, value in payload.items():
+        if isinstance(value, dict):
+            value = value.get("postResponseDto") or []
+        if not isinstance(value, list):
+            continue
+        for entry in value:
+            if not isinstance(entry, dict):
+                continue
+            if "postResponseDto" in entry:
+                out.extend((bucket, post)
+                           for post in (entry.get("postResponseDto") or [])
+                           if isinstance(post, dict))
+            else:
+                out.append((bucket, entry))
+    return out
+
+
+def from_newsfirst(client: httpx.Client, src: dict, limit: int = 40) -> list[Article]:
+    """
+    Adapter 6: the NewsFirst in-house JSON API (`src["api"]`).
+
+    sinhala/english/tamil.newsfirst.lk are single-page apps: /feed 403s,
+    /wp-json answers 200 with the SPA shell rather than JSON, and every
+    unknown path returns index.html, so the generic ladder can only fall
+    through to Google. Their front-ends read one endpoint — /post/sticky —
+    which returns every homepage bucket in a single request, with real
+    `date_gmt` timestamps and image URLs that Google links never carry.
+
+    One GET yields the whole front page, so there is no pagination to walk;
+    `limit` simply truncates.
+    """
+    api = src.get("api")
+    if not api:
+        return []
+    r = get(client, f"{api.rstrip('/')}/post/sticky")
+    if r is None:
+        return []
+    try:
+        payload = r.json()
+    except ValueError:
+        log.warning("%s: newsfirst api returned non-JSON", src["id"])
+        return []
+
+    out: list[Article] = []
+    seen: set[str] = set()
+    for bucket, post in _newsfirst_posts(payload):
+        if post.get("status") not in (None, "publish"):
+            continue
+        path = post.get("post_url")
+        title = clean_text((post.get("title") or {}).get("rendered"), limit=300)
+        if not path or not title:
+            continue
+        # date_gmt is already UTC; `date` is Colombo local with a bare
+        # "13-09-2026T7:33 AM" shape that dateutil reads as month 13.
+        published = to_iso(post.get("date_gmt"), naive_tz=timezone.utc)
+        if not published:
+            continue
+
+        try:
+            url = canonical_url(encode_url_path(urljoin(src["site"], str(path))))
+        except ValueError:
+            continue
+        if not valid_web_url(url) or url in seen:
+            continue
+        seen.add(url)
+
+        image = (post.get("images") or {}).get("news_detail_image")
+        if image:
+            image = encode_url_path(str(image))
+            if not valid_web_url(image):
+                image = None
+
+        out.append(Article(
+            id=article_id(url),
+            source_id=src["id"],
+            source_name=src["name"],
+            lang=src["lang"],
+            title=title,
+            url=url,
+            published=published,
+            excerpt=clean_text((post.get("excerpt") or {}).get("rendered")),
+            image=image,
+            category=NEWSFIRST_CATEGORIES.get(bucket),
+        ))
+        if len(out) >= limit:
+            break
+    return out
+
+
 def discover_sitemaps(client: httpx.Client, site: str) -> list[str]:
     """Find news sitemaps via robots.txt, then fall back to common paths."""
     found: list[str] = []
@@ -502,20 +701,34 @@ def from_sitemap(client: httpx.Client, src: dict, limit: int = 40) -> list[Artic
     Any outlet that wants to appear in Google News publishes one. It is
     structured XML with title, publication date and language — better than
     scraping and nearly as reliable as RSS.
+
+    A sitemap index sometimes contains one child per year or per offset with
+    no "news" hint in its name (e.g. numeric-offset archives). Picking only
+    the first such child can silently return years-old articles from an
+    otherwise-healthy source. When a batch isn't fresh and other candidates
+    remain, keep looking rather than accepting the first non-empty result.
     """
     urls = [src["sitemap"]] if src.get("sitemap") else discover_sitemaps(client, src["site"])
 
-    for sm_url in urls:
+    best: list[Article] = []
+    best_age: float | None = None
+    seen_index = 0
+    while seen_index < len(urls):
+        sm_url = urls[seen_index]
+        seen_index += 1
         r = get(client, sm_url)
         if r is None:
             continue
         soup = BeautifulSoup(r.content, "xml")
 
-        # A sitemap index points at other sitemaps; follow the first news-ish one.
+        # A sitemap index points at other sitemaps; follow news-ish children,
+        # and — if none are named for it — sample both ends of the list
+        # rather than assuming the first entry is the newest.
         if soup.find("sitemapindex"):
             children = [loc.get_text(strip=True) for loc in soup.find_all("loc")]
-            news_children = [c for c in children if "news" in c.lower()] or children[:1]
-            urls.extend(c for c in news_children[:2] if c not in urls)
+            news_children = [c for c in children if "news" in c.lower()]
+            candidates = news_children[:2] or (children[:1] + children[-1:])
+            urls.extend(c for c in candidates if c not in urls)
             continue
 
         out: list[Article] = []
@@ -550,9 +763,17 @@ def from_sitemap(client: httpx.Client, src: dict, limit: int = 40) -> list[Artic
                 url=url,
                 published=published,
             ))
-        if out:
+        if not out:
+            continue
+
+        age = freshest_age_hours(out)
+        if age is not None and age <= FRESH_WINDOW_HOURS:
             return out
-    return []
+        if best_age is None or (age is not None and age < best_age):
+            best, best_age = out, age
+        elif not best:
+            best = out
+    return best
 
 
 def from_html(client: httpx.Client, src: dict, limit: int = 40) -> list[Article]:
@@ -702,21 +923,27 @@ def from_google_news(client: httpx.Client, src: dict, limit: int = 40) -> list[A
     """
     Adapter 5: last resort. Never pin this if a direct adapter works.
 
-    Tries several query forms and keeps the most productive, because a single
-    form silently returns near-zero for some outlets.
+    Tries several query forms and keeps the most useful, ranked by verified
+    freshness first and raw count second — a query that returns 40 results
+    all months old is worse than one returning 5 from today, and picking by
+    quantity alone silently prefers the former.
     """
     domain = urlparse(src["site"]).netloc.lower().removeprefix("www.")
     best: list[Article] = []
+    best_score = (-1, -1)
     for url in _google_variants(src):
         r = get(client, url, quiet=True)
         if r is None:
             continue
         items = _parse_google_feed(r.content, src, domain, limit)
-        if len(items) > len(best):
-            best = items
+        if not items:
+            continue
+        score = (count_fresh(items), len(items))
+        if score > best_score:
+            best, best_score = items, score
         # Good enough — stop paying for more requests, and more importantly
         # stop adding to the request burst Google is measuring.
-        if len(best) >= min(limit, 10):
+        if best_score[0] >= min(limit, 10):
             break
     return best
 
@@ -859,9 +1086,13 @@ def resolve_google_url(
 # Cheapest and most durable first. google is last on purpose: it always works,
 # so anything that ranks it above a direct adapter will quietly stop us from
 # ever fixing the direct one.
-ADAPTER_PREFERENCE = ["rss", "wordpress", "sitemap", "html", "google"]
+# rss stays first: it is the generic, cheapest, most durable path. The
+# vendor-specific adapters sit below it and are gated by _can_try(), so
+# they are only ever reached by a source that configures them.
+ADAPTER_PREFERENCE = ["rss", "newsfirst", "wordpress", "sitemap", "html", "google"]
 
 ADAPTERS = {
+    "newsfirst": from_newsfirst,
     "rss": from_rss,
     "wordpress": from_wordpress,
     "sitemap": from_sitemap,
@@ -873,6 +1104,8 @@ ADAPTERS = {
 def primary_endpoint(client: httpx.Client, src: dict) -> str:
     """The single URL this source depends on, for diagnostics."""
     adapter = src.get("adapter", "rss")
+    if adapter == "newsfirst":
+        return f"{str(src.get('api', src['site'])).rstrip('/')}/post/sticky"
     if adapter == "rss":
         feeds = src.get("feeds") or ([src["feed"]] if src.get("feed") else [])
         return feeds[0] if feeds else src["site"]
@@ -903,6 +1136,8 @@ def diagnose_endpoint(client: httpx.Client, src: dict) -> dict[str, Any]:
     info: dict[str, Any] = {"endpoint": url}
     try:
         r = client.get(url)
+        if r.history:
+            info["redirect_chain"] = [str(h.url)[:160] for h in r.history[:6]] + [str(r.url)[:160]]
         info.update(
             status=r.status_code,
             server=r.headers.get("server", "")[:40],
@@ -910,14 +1145,35 @@ def diagnose_endpoint(client: httpx.Client, src: dict) -> dict[str, Any]:
             bytes=len(r.content),
             final_url=str(r.url)[:160] if str(r.url) != url else None,
         )
+        # A Cloudflare 403 is two different problems with opposite fixes, so
+        # name which one it is. An *interactive challenge* ("Just a moment...")
+        # is solved by running JavaScript, which a browser does and this client
+        # never will -- moving to a residential IP does not fix it. A plain
+        # block is about where the request came from, and a different IP might.
+        challenge = (r.headers.get("cf-mitigated", "").lower() == "challenge"
+                     or any(m in r.text[:20000].lower() for m in
+                            ("challenge-platform", "cf_chl", "just a moment")))
         if r.status_code in (403, 503) and "cloudflare" in info["server"].lower():
-            info["hint"] = "Cloudflare is blocking this IP"
+            info["cf_mitigated"] = r.headers.get("cf-mitigated") or None
+            info["hint"] = (
+                "Cloudflare JS challenge — a browser passes it, this client "
+                "cannot; a residential IP will not fix it"
+                if challenge else
+                "Cloudflare is blocking this IP")
         elif r.status_code == 404:
             info["hint"] = "endpoint moved — re-run probe.py"
         elif r.status_code == 200 and info["bytes"] < 500:
             info["hint"] = "200 but almost empty — likely a challenge page"
+        elif r.status_code == 200 and info.get("redirect_chain") and len(
+                {urlparse(u).path for u in info["redirect_chain"]}) == 1:
+            info["hint"] = ("redirects to itself — either bot mitigation or a "
+                            "broken server; open it in a browser to tell which")
         elif r.status_code == 200:
             info["hint"] = "200 with content — our parser is the problem"
+    except httpx.TooManyRedirects as e:
+        info["exception"] = f"redirect loop: {str(e).splitlines()[0][:90]}"
+        info["hint"] = ("endless redirect loop — open the URL in a browser: if it "
+                        "fails there too the site is broken, not blocking us")
     except httpx.HTTPError as e:
         info["exception"] = f"{type(e).__name__}: {str(e).splitlines()[0][:90]}"
     return {k: v for k, v in info.items() if v is not None}

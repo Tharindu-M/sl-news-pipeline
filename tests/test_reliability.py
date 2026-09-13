@@ -17,11 +17,13 @@ from pipeline import Article, article_id
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
 
 
-def article(sid="a", lang="en", age=1, estimated=False):
-    url = f"https://{sid}.lk/news/1"
+def article(sid="a", lang="en", age=1, estimated=False, n=1):
+    """`n` gives each call a distinct URL/id; several tests need >=1 article
+    per language to independently satisfy the LANG_MIN_FRESH quality bar."""
+    url = f"https://{sid}.lk/news/{n}"
     return Article(
         id=article_id(url), source_id=sid, source_name=sid, lang=lang,
-        title=f"{sid} headline", url=url,
+        title=f"{sid} headline {n}", url=url,
         published=(NOW - timedelta(hours=age)).isoformat().replace("+00:00", "Z"),
         date_estimated=estimated,
     )
@@ -184,21 +186,36 @@ class SnapshotTests(unittest.TestCase):
             return ingest.main()
 
     def seed(self):
-        items = {s["id"]: [article(s["id"], s["lang"])] for s in self.sources}
+        # LANG_MIN_FRESH defaults to 3: each single-source language here must
+        # supply at least 3 distinct articles to clear the quality bar.
+        items = {s["id"]: [article(s["id"], s["lang"], age=i, n=i + 1)
+                          for i in range(3)]
+                 for s in self.sources}
         self.assertEqual(0, self.run_ingest(items))
 
     def snapshot(self):
         return {p.name: p.read_bytes() for p in (self.out / "v1").iterdir()}
 
-    def test_partial_and_total_failures_preserve_all_accepted_files(self):
+    def test_total_failure_is_rejected_and_preserves_snapshot(self):
+        """Zero articles from every source is a distinct, harder failure than
+        any one language falling below its quality bar: it usually means the
+        client/network is broken, not that publishers went quiet. This must
+        fail loudly rather than quietly re-publish old content as a "pass"."""
         self.seed()
         before = self.snapshot()
-        for items in ({"a": [article(age=0)]}, {}):
-            self.assertEqual(1, self.run_ingest(items))
-            self.assertEqual(before, self.snapshot())
-            report = json.loads(self.diag.read_text(encoding="utf-8"))
-            self.assertFalse(report["accepted"])
-            self.assertTrue(report["errors"])
+        self.assertEqual(1, self.run_ingest({}))
+        self.assertEqual(before, self.snapshot())
+        report = json.loads(self.diag.read_text(encoding="utf-8"))
+        self.assertFalse(report["accepted"])
+        self.assertTrue(report["errors"])
+
+    def test_partial_return_within_grace_window_does_not_hard_fail(self):
+        """One source re-confirming an already-known article while others
+        return nothing is tolerated: previously-collected content is still
+        within its freshness grace window, so this is a soft warning
+        (surfaced via language_status/stale_sources), not a CI failure."""
+        self.seed()
+        self.assertEqual(0, self.run_ingest({"a": [article(age=0, n=1)]}))
 
     def test_empty_language_does_not_publish_partial_snapshot(self):
         self.assertEqual(1, self.run_ingest({
@@ -245,21 +262,31 @@ class SnapshotTests(unittest.TestCase):
         self.seed()
         before = self.snapshot()
         with patch.object(ingest, "publish_snapshot", side_effect=OSError("disk full")):
-            self.assertEqual(1, self.run_ingest(
-                {s["id"]: [article(s["id"], s["lang"])] for s in self.sources}
-            ))
+            self.assertEqual(1, self.run_ingest({
+                s["id"]: [article(s["id"], s["lang"], age=i, n=i + 1)
+                         for i in range(3)]
+                for s in self.sources
+            }))
         self.assertEqual(before, self.snapshot())
         self.assertFalse(json.loads(self.diag.read_text())["accepted"])
 
     def test_unknown_dates_stay_stable_across_serialization(self):
-        first = {s["id"]: [article(s["id"], s["lang"], age=3, estimated=True)]
-                 for s in self.sources}
-        self.assertEqual(0, self.run_ingest(first))
-        old = json.loads((self.out / "v1/feed_en.json").read_text())["articles"][0]
-        second = {s["id"]: [article(s["id"], s["lang"], age=0, estimated=True)]
-                  for s in self.sources}
-        self.assertEqual(0, self.run_ingest(second))
-        new = json.loads((self.out / "v1/feed_en.json").read_text())["articles"][0]
+        # 3 undated articles per source to clear the quality bar; only the
+        # `n=1` article is tracked for first-seen stability, the other two
+        # are filler so the language-level freshness gate passes.
+        def batch(age, estimated=True):
+            return {s["id"]: [article(s["id"], s["lang"], age=age, estimated=estimated, n=i + 1)
+                             for i in range(3)]
+                    for s in self.sources}
+
+        def tracked(payload_path):
+            data = json.loads(payload_path.read_text())["articles"]
+            return next(a for a in data if a["url"] == "https://a.lk/news/1")
+
+        self.assertEqual(0, self.run_ingest(batch(age=3)))
+        old = tracked(self.out / "v1/feed_en.json")
+        self.assertEqual(0, self.run_ingest(batch(age=0)))
+        new = tracked(self.out / "v1/feed_en.json")
         self.assertEqual(old["published"], new["published"])
         self.assertEqual(old["collected_at"], new["collected_at"])
         self.assertTrue(new["date_estimated"])

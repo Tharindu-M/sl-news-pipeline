@@ -3,7 +3,8 @@ from datetime import datetime, timezone, timedelta
 sys.path.insert(0, "..")
 sys.path.insert(0, ".")
 from pipeline import (canonical_url, dedupe_key, article_id, clean_text, to_iso,
-                      Article, dedupe, from_rss, from_wordpress, from_sitemap, from_html)
+                      Article, dedupe, from_rss, from_wordpress, from_sitemap, from_html,
+                      from_newsfirst, encode_url_path, parse_relative_date)
 
 fails = []
 def check(name, cond, detail=""):
@@ -37,6 +38,28 @@ check("rejects far future", to_iso("2031-01-01") is None)
 check("rejects ancient", to_iso("1999-01-01") is None)
 check("rejects garbage", to_iso("not a date") is None)
 check("struct_time", to_iso((2026,9,11,10,0,0,0,0,0)).startswith("2026-09-11T10:00"))
+
+# --- relative dates -------------------------------------------------------
+# Lankadeepa labels everything from the last ~24h as "5 hours ago"; dateutil
+# raises on that, so these used to become fabricated scrape-time dates and
+# sort above genuinely newer articles.
+_ref = datetime(2026, 9, 13, 12, 0, tzinfo=timezone.utc)
+def _rel(t): return parse_relative_date(t, now=_ref)
+check("relative hours", _rel("5 hours ago") == _ref - timedelta(hours=5))
+check("relative minutes", _rel("17 minutes ago") == _ref - timedelta(minutes=17))
+check("relative singular", _rel("1 hour ago") == _ref - timedelta(hours=1))
+check("relative article form", _rel("an hour ago") == _ref - timedelta(hours=1))
+check("relative days", _rel("2 days ago") == _ref - timedelta(days=2))
+check("relative yesterday", _rel("yesterday") == _ref - timedelta(days=1))
+check("relative just now", _rel("just now") == _ref)
+check("relative is utc aware", _rel("5 hours ago").tzinfo is not None)
+# "ago" is a substring of "Chicago" — the unit word is what makes it safe.
+check("relative ignores Chicago", _rel("Chicago bulls win tonight") is None)
+check("relative ignores bare ago", _rel("ago") is None)
+check("relative ignores unknown unit", _rel("5 bananas ago") is None)
+check("relative ignores absolute date", _rel("11 September 2026") is None)
+check("to_iso routes relative dates",
+      to_iso("5 hours ago") is not None and to_iso("11 September 2026") == "2026-09-10T18:30:00Z")
 
 # --- fake HTTP client -----------------------------------------------------
 class R:
@@ -112,6 +135,62 @@ hsrc = {"id":"lankadeepa","name":"Lankadeepa","lang":"si","site":"https://www.la
 ha = from_html(C({"latest_news": html}), hsrc)
 check("html parses", len(ha) == 1, f"got {len(ha)} (dup should collapse)")
 check("html lazy img", ha[0].image == "https://www.lankadeepa.lk/img/a.jpg" if ha else False)
+
+# --- newsfirst JSON api ---------------------------------------------------
+# Shapes taken from the live response: buckets hold *either* bare posts or a
+# {rowCount, postResponseDto} wrapper, and image paths arrive unencoded.
+nf_post = {
+  "id": "623751", "status": "publish", "type": "post",
+  "date": "13-09-2026T12:44 PM",                      # local, dateutil-hostile
+  "date_gmt": (now - timedelta(hours=2)).isoformat().replace("+00:00", "Z"),
+  "title": {"rendered": si},
+  "excerpt": {"rendered": "<p>body text</p>"},
+  "post_url": "2026/09/13/%e0%b6%9a%e0%b7%8f%e0%b6%b1",
+  "images": {"news_detail_image":
+             "https://cdn.newsfirst.lk/sinhala-uploads/New Project (2)-1.jpg"},
+}
+nf_payload = json.dumps({
+  "stickyPost": {"postResponseDto": [{"rowCount": "1", "postResponseDto": [nf_post]}]},
+  "sportPost":  {"postResponseDto": [dict(nf_post, id="2", post_url="2026/09/13/sport")]},
+  "worldPost":  {"postResponseDto": [dict(nf_post, id="3", post_url="2026/09/13/world")]},
+  "draftPost":  {"postResponseDto": [dict(nf_post, id="4", post_url="2026/09/13/d",
+                                          status="draft")]},
+  "latestPost": {"postResponseDto": [dict(nf_post)]},   # same url as sticky
+})
+nsrc = {"id": "newsfirst-si", "name": "NewsFirst Sinhala", "lang": "si",
+        "site": "https://sinhala.newsfirst.lk", "api": "https://apisinhala.newsfirst.lk"}
+na = from_newsfirst(C({"post/sticky": nf_payload}), nsrc)
+check("newsfirst parses both envelope shapes", len(na) == 3, f"got {len(na)}")
+check("newsfirst dedupes repeated post across buckets",
+      len({a.url for a in na}) == len(na))
+check("newsfirst drops non-published", all("/d" != a.url[-2:] for a in na))
+# clean_text() collapses the doubled space in `si`, same as the assertion above.
+check("newsfirst keeps sinhala title", na and na[0].title == clean_text(si, limit=300),
+      na[0].title if na else None)
+check("newsfirst builds absolute url",
+      na and na[0].url.startswith("https://sinhala.newsfirst.lk/2026/09/13/"), na[0].url)
+check("newsfirst does not double-encode an encoded path",
+      na and "%25" not in na[0].url, na[0].url)
+check("newsfirst encodes spaces in image url",
+      na and na[0].image == "https://cdn.newsfirst.lk/sinhala-uploads/New%20Project%20%282%29-1.jpg",
+      na[0].image)
+check("newsfirst uses date_gmt, not the local date field",
+      na and not na[0].date_estimated and na[0].published.endswith("Z"))
+check("newsfirst maps bucket to category",
+      {a.category for a in na} == {None, "sports", "international"},
+      {a.category for a in na})
+check("newsfirst honours limit", len(from_newsfirst(C({"post/sticky": nf_payload}), nsrc, limit=1)) == 1)
+check("newsfirst without api returns nothing",
+      from_newsfirst(C({"post/sticky": nf_payload}), {k: v for k, v in nsrc.items() if k != "api"}) == [])
+check("newsfirst survives non-JSON", from_newsfirst(C({"post/sticky": "<html>nope"}), nsrc) == [])
+check("newsfirst survives unexpected shape",
+      from_newsfirst(C({"post/sticky": json.dumps([1, 2, 3])}), nsrc) == [])
+
+check("encode_url_path leaves clean urls alone",
+      encode_url_path("https://x.lk/a/b?c=1") == "https://x.lk/a/b?c=1")
+check("encode_url_path is idempotent",
+      encode_url_path(encode_url_path("https://x.lk/New File (1).jpg"))
+      == encode_url_path("https://x.lk/New File (1).jpg"))
 
 # --- dedupe ---------------------------------------------------------------
 def mk(u, t, img=None, h=1):
