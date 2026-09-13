@@ -71,7 +71,8 @@ sources:
     name: NewsFirst
     lang: en
     site: https://english.newsfirst.lk
-    adapter: google          # google only, 3h old
+    adapter: newsfirst       # CONFIRMED: in-house JSON API, one GET, real dates
+    api: https://apienglish.newsfirst.lk
 
   - id: daily-ft
     name: Daily FT
@@ -127,21 +128,40 @@ sources:
     lang: si
     site: https://www.mawbima.lk
     adapter: wordpress
+    enabled: false
     feeds:
       - https://www.mawbima.lk/feed
       - https://www.mawbima.lk/rss.xml
-    # re-enabled: ladder now tries rss/sitemap/google before giving up
+    # Parked 2026-09-13: Cloudflare *interactive challenge* on the whole
+    # domain, robots.txt included -- `cf-mitigated: challenge`, a "Just a
+    # moment..." page asking for JavaScript. A browser solves it and gets in
+    # (confirmed in-browser: "Performing security verification"); this client
+    # executes no JS, so it sees 403 on every rung. Google has 0 for the
+    # domain, so there is no fallback either.
+    #
+    # A residential IP does NOT fix this -- the challenge is about running
+    # JavaScript, not about where the request came from. The only real options
+    # are publisher-granted feed access or a headless browser, and a browser
+    # in a 20-minute cron is a big dependency for one Sinhala source.
+    # Re-check with: probe.py --id mawbima --diagnose
 
   # ------------------------------------------------------------------ Tamil
 
   - id: ada-derana-ta
     name: Ada Derana Tamil
     lang: ta
-    site: https://tamil.adaderana.lk
-    adapter: google
-    enabled: false        # check the real URL — tamil.adaderana.lk may be wrong
-                          # re-enable: probe.py --id ada-derana-ta --diagnose
-    feed: https://tamil.adaderana.lk/rss.php
+    # NOT a subdomain of adaderana.lk: the Tamil edition lives on its own
+    # domain, and tamil.adaderana.lk does not resolve. That wrong guess is
+    # why this source sat parked on a google adapter.
+    site: https://adaderanatamil.lk
+    adapter: rss             # CONFIRMED: 40 items, all with excerpts, 0h old
+    feed: https://adaderanatamil.lk/rss.xml
+    # Only the one feed: /rss.php 302s to this exact file, and listing both
+    # made from_rss() fetch it twice and report a doubled `count` in
+    # status.json (it does not dedupe across feeds -- ingest's dedupe() does).
+    # /wp-json 403s and /news-sitemap.xml lags ~17h behind the feed, so RSS is
+    # both the cheapest and the freshest option here. No images in the feed --
+    # enrichment fills them from og:image.
 
   - id: virakesari
     name: Virakesari
@@ -154,10 +174,23 @@ sources:
     lang: ta
     site: https://www.thinakkural.lk
     adapter: wordpress
+    enabled: false
     feeds:
       - https://www.thinakkural.lk/feed
       - https://www.thinakkural.lk/rss.xml
-    # re-enabled to widen thin Tamil coverage
+    # Parked 2026-09-13: the site is broken for everyone, not just for us.
+    # https://www.thinakkural.lk/ answers 308 redirecting to *itself*, an
+    # infinite self-loop (the apex does the same), so a real browser fails
+    # with the same error we get. Confirmed by the maintainer in-browser.
+    # Google has dropped it too: a site:thinakkural.lk search returns 0.
+    #
+    # DO NOT "fix" this by switching to thinakkural.com. That domain resolves
+    # and loads, but it is not the newspaper -- it now serves CPAP-machine SEO
+    # spam (see its sitemap.xml). Ada Derana Tamil really did live on another
+    # domain; this one does not.
+    #
+    # Re-check by loading the .lk URL in a browser. If it stops self-
+    # redirecting, the wordpress/rss rungs are worth re-probing.
 
   - id: tamil-mirror
     name: Tamil Mirror
@@ -202,10 +235,19 @@ sources:
     lang: si
     site: https://www.ada.lk
     adapter: sitemap
+    enabled: false
+    sitemap: https://www.ada.lk/sitemaps
     feeds:
       - https://www.ada.lk/rss.php
       - https://www.ada.lk/feed
-    # lk_news gets ~87/week from this outlet, so it is worth retrying
+    # Parked 2026-09-13. The real sitemap index is /sitemaps (no extension,
+    # per robots.txt) -- the guessed *news*.xml paths all 404 and rss.php is
+    # gone. But it is not usable: the index takes ~25s, its newest chunk
+    # ~62s, and that chunk carries 999 URLs with no <lastmod> or
+    # news:publication_date at all. Undated articles can never satisfy the
+    # verified-freshness gate, so this costs ~86s per run and still falls
+    # through to Google. `sitemap:` is pinned above so a future attempt
+    # starts from the right URL rather than re-deriving it.
 
   - id: island
     name: The Island
@@ -230,15 +272,15 @@ sources:
     name: NewsFirst Tamil
     lang: ta
     site: https://tamil.newsfirst.lk
-    adapter: google          # google only, 28h old
+    adapter: newsfirst       # CONFIRMED: in-house JSON API, one GET, real dates
+    api: https://apitamil.newsfirst.lk
 
   - id: newsfirst-si
     name: NewsFirst Sinhala
     lang: si
     site: https://sinhala.newsfirst.lk
-    adapter: wordpress
-    feeds:
-      - https://sinhala.newsfirst.lk/feed
-      - https://sinhala.newsfirst.lk/rss.xml
-    # WordPress like its English and Tamil siblings
+    adapter: newsfirst       # CONFIRMED: in-house JSON API, one GET, real dates
+    api: https://apisinhala.newsfirst.lk
+    # Not WordPress from outside: /feed 403s and /wp-json answers 200 with the
+    # SPA shell, which is why this used to fall through to a stale Google feed.
 

@@ -84,6 +84,8 @@ def _can_try(adapter: str, src: dict) -> bool:
         return bool(src.get("feeds") or src.get("feed"))
     if adapter == "html":
         return bool(src.get("selectors"))
+    if adapter == "newsfirst":
+        return bool(src.get("api"))
     return True
 
 
