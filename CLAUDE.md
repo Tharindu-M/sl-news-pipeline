@@ -120,18 +120,28 @@ the freshest option (`/rss.php` 302s to it); `/wp-json` 403s and
 this domain is **not** behind the CloudFront block — whether that holds from
 a CI runner still needs confirming from an Actions run.
 
-**Two sources are IP-blocked from CI**, and work fine from a UK home
-connection:
+**Four sources are blocked from CI** and work fine from a UK home
+connection. They are blocked in two different ways, confirmed from a live
+`main` run on 2026-09-13:
 
-| source | block |
-|---|---|
-| `ada-derana-en` / `ada-derana-si` | 403 CloudFront (whole domain) |
-| `divaina` | 403 Cloudflare (whole domain, including `/feed`) |
+| source | block | would a residential IP help? |
+|---|---|---|
+| `ada-derana-en` / `-si` / `-ta` | 403 CloudFront, no challenge markers | yes, plausibly |
+| `divaina` | 403 Cloudflare, `cf-mitigated: challenge` | **no** |
 
-No adapter change fixes this. The durable options are asking the publishers
-for feed access, running ingestion from a residential IP, or accepting
-Google's thin coverage. Ada Derana Sinhala gets ~18/run via Google; Divaina
-gets 1.
+`divaina` and `mawbima` are interactive JS challenges: the gate is executing
+JavaScript, not the source IP, so moving runners cannot fix them. Only the
+Ada Derana domains are genuinely IP-based. `ada-derana-ta` is the odd one:
+`adaderanatamil.lk` is a separate domain that is clean from a home
+connection, but CloudFront still 403s it from a runner.
+
+**Decision (2026-09-13): run with what works.** All four degrade to the
+Google fallback rather than failing, so the feeds stay populated. Chasing
+publisher feed access or a residential runner is parked, not planned. If it
+is ever revisited, the table above says which sources it could actually help.
+
+No adapter change fixes any of this. Ada Derana Sinhala gets ~2-18/run via
+Google; Divaina gets 1.
 
 **Tell an IP block apart from a JS challenge before reaching for a fix** —
 they look identical (403, `server: cloudflare`) and need opposite responses.
