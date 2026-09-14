@@ -206,6 +206,98 @@ check("dedupe sorts desc", d[0].published > d[1].published)
 n = dedupe([mk("https://x.lk/3","Same Headline Here"), mk("https://x.lk/4","Same  headline, here!")])
 check("dedupe near-dup titles", len(n) == 1, f"got {len(n)}")
 
+# --- category normalisation ----------------------------------------------
+from pipeline import (CATEGORY_TERMS, normalise_term, category_from_terms,
+                      NEWSFIRST_CATEGORIES)
+sys.path.insert(0, ".")
+import ingest as _ing
+
+check("every mapped bucket is a real category",
+      set(CATEGORY_TERMS.values()) <= set(_ing.CATEGORIES),
+      set(CATEGORY_TERMS.values()) - set(_ing.CATEGORIES))
+check("every newsfirst bucket is a real category",
+      set(NEWSFIRST_CATEGORIES.values()) <= set(_ing.CATEGORIES),
+      set(NEWSFIRST_CATEGORIES.values()) - set(_ing.CATEGORIES))
+
+# Divaina's own taxonomy spells sports with a stray U+200B *inside* the word,
+# so a literal "ක්‍රීඩා" never matches it. U+200D must survive: it is the ZWJ
+# that forms the ක්‍ර conjunct, and stripping it would corrupt the term.
+check("strips stray zero-width space",
+      category_from_terms("ක්‍රී​ඩා") == "sports")
+check("keeps the ZWJ that forms a sinhala conjunct",
+      "‍" in normalise_term("ක්‍රීඩා"))
+check("unescapes html entities",
+      category_from_terms("Stocks &amp; Companies") == "business")
+check("casefolds and collapses whitespace",
+      category_from_terms("  ECONOMY  ") == "business")
+check("tamil term maps", category_from_terms("விளையாட்டு") == "sports")
+check("unknown term is left alone", category_from_terms("Nakatha") is None)
+check("empty term is left alone",
+      category_from_terms(None, "", "   ") is None)
+for placement in ("News", "Lead Story", "latest", "top-story", "Uncategorized",
+                  "ප්‍රධාන පුවත්", "විගස පුවත්"):
+    check(f"placement {placement!r} stays uncategorised",
+          category_from_terms(placement) is None, category_from_terms(placement))
+check("first subject term wins over a leading placement",
+      category_from_terms("News", "Sports") == "sports")
+
+# --- wordpress categories (wp:term rides along with _embed) ---------------
+wpc = json.dumps([{
+  "link": "https://www.divaina.lk/sports-news/cricket-win",
+  "title": {"rendered": "Sri Lanka win"},
+  "date_gmt": (now - timedelta(hours=1)).isoformat(),
+  "_embedded": {"wp:term": [
+      [{"taxonomy": "category", "name": "ප්‍රධාන පුවත්"},
+       {"taxonomy": "category", "name": "ක්‍රී​ඩා"}],
+      [{"taxonomy": "post_tag", "name": "Business"}],
+  ]},
+}])
+wcsrc = {"id": "divaina", "name": "Divaina", "lang": "si",
+         "site": "https://www.divaina.lk"}
+wc = from_wordpress(C({"wp-json": wpc}), wcsrc)
+check("wp reads category from wp:term", wc and wc[0].category == "sports",
+      wc[0].category if wc else "no articles")
+check("wp ignores post_tag taxonomy", wc and wc[0].category != "business")
+check("wp without wp:term has no category", wa[0].category is None, wa[0].category)
+
+# --- rss <category> -------------------------------------------------------
+rssc = f"""<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel>
+<item><title>Match report</title><link>https://www.adaderana.lk/news/1</link>
+<category>sports</category><pubDate>{recent}</pubDate></item>
+<item><title>Plain</title><link>https://www.adaderana.lk/news/2</link>
+<category>other</category><pubDate>{recent}</pubDate></item>
+</channel></rss>"""
+rc = from_rss(C({"rss.php": rssc}),
+              {"id": "ada-derana-en", "name": "Ada Derana", "lang": "en",
+               "site": "https://www.adaderana.lk",
+               "feed": "https://www.adaderana.lk/rss.php"})
+check("rss reads <category>", rc and rc[0].category == "sports",
+      rc[0].category if rc else "no articles")
+check("rss leaves unknown <category> null",
+      len(rc) == 2 and rc[1].category is None,
+      rc[1].category if len(rc) > 1 else "missing")
+
+# --- dedupe must not destroy a category ----------------------------------
+# The quality tuple is lexicographic and `stale` outranks metadata, so a fresh
+# category-less copy wins and replaces the cached object wholesale. Without
+# the carry-across, one cycle on the Google fallback erases the bucket for
+# good -- the id does not change, so it never comes back.
+cached = mk("https://x.lk/9", "Budget speech")
+cached.category, cached.stale = "business", True
+fresh_copy = mk("https://x.lk/9", "Budget speech")
+dc = dedupe([fresh_copy, cached])
+check("fresh copy still wins", len(dc) == 1 and dc[0].stale is False)
+check("category survives a category-less fresh copy",
+      dc[0].category == "business", dc[0].category)
+
+# and the reverse: a fresh category must not be dropped onto a stale winner
+cached2 = mk("https://x.lk/10", "Rupee steady")
+cached2.stale = True
+fresh2 = mk("https://x.lk/10", "Rupee steady")
+fresh2.category = "business"
+check("fresh category is kept",
+      dedupe([fresh2, cached2])[0].category == "business")
+
 # --- adapter registry invariants (the bug that crashed probe.py) ----------
 from pipeline import ADAPTERS as _A, ADAPTER_PREFERENCE as _P
 check("every adapter is ranked", set(_A) == set(_P), f"{set(_A) ^ set(_P)}")

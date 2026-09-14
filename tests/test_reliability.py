@@ -158,7 +158,10 @@ class UrlTests(unittest.TestCase):
         self.assertEqual("Good", items[0].title)
 
 
-class SnapshotTests(unittest.TestCase):
+class SnapshotHarness(unittest.TestCase):
+    """Config + patched-adapter plumbing. Holds no tests of its own, so
+    subclasses do not re-run each other's cases."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -196,6 +199,8 @@ class SnapshotTests(unittest.TestCase):
     def snapshot(self):
         return {p.name: p.read_bytes() for p in (self.out / "v1").iterdir()}
 
+
+class SnapshotTests(SnapshotHarness):
     def test_total_failure_is_rejected_and_preserves_snapshot(self):
         """Zero articles from every source is a distinct, harder failure than
         any one language falling below its quality bar: it usually means the
@@ -293,6 +298,126 @@ class SnapshotTests(unittest.TestCase):
         report = json.loads(self.diag.read_text())
         self.assertEqual(["a", "b", "c"], report["stale_sources"])
         self.assertEqual(0, report["detail"]["a"]["new_articles"])
+
+
+class CategoryTests(unittest.TestCase):
+    """sources.yaml-declared categories, and their survival across runs."""
+
+    def apply(self, src, arts):
+        ingest.apply_source_categories({src["id"]: src}, arts)
+        return arts
+
+    def test_url_categories_bucket_by_path_segment(self):
+        src = {"id": "divaina", "url_categories": {"sports-news": "sports"}}
+        a = article("divaina")
+        a.url = "https://www.divaina.lk/sports-news/match-report"
+        self.assertEqual("sports", self.apply(src, [a])[0].category)
+
+    def test_url_categories_ignores_unmapped_segment(self):
+        """A placement segment must not borrow some other section's bucket."""
+        src = {"id": "divaina", "url_categories": {"sports-news": "sports"}}
+        a = article("divaina")
+        a.url = "https://www.divaina.lk/main-news/budget"
+        self.assertIsNone(self.apply(src, [a])[0].category)
+
+    def test_url_categories_matches_a_percent_encoded_segment(self):
+        """
+        Tamil Mirror files stories under Tamil section names, so the path
+        arrives percent-encoded. sources.yaml carries the readable slug.
+        """
+        src = {"id": "tamil-mirror",
+               "url_categories": {"உலக-செய்திகள்": "international"}}
+        a = article("tamil-mirror", lang="ta")
+        a.url = ("https://www.tamilmirror.lk/%E0%AE%89%E0%AE%B2%E0%AE%95-"
+                 "%E0%AE%9A%E0%AF%86%E0%AE%AF%E0%AF%8D%E0%AE%A4%E0%AE%BF"
+                 "%E0%AE%95%E0%AE%B3%E0%AF%8D/123")
+        self.assertEqual("international", self.apply(src, [a])[0].category)
+
+    def test_url_categories_skips_unresolved_google_link(self):
+        """
+        The path of a news.google.com redirect belongs to Google, not the
+        publisher -- matching against it would bucket by an opaque id.
+        """
+        src = {"id": "divaina", "url_categories": {"articles": "sports"}}
+        a = article("divaina")
+        a.url = "https://news.google.com/rss/articles/CBMiK0FVX3lxTE"
+        self.assertIsNone(self.apply(src, [a])[0].category)
+
+    def test_pinned_category_applies_to_every_article(self):
+        src = {"id": "lk", "category": "business"}
+        self.assertEqual("business", self.apply(src, [article("lk")])[0].category)
+
+    def test_adapter_category_beats_sources_yaml(self):
+        """A publisher's own taxonomy is better evidence than our guess."""
+        src = {"id": "lk", "category": "business",
+               "url_categories": {"news": "politics"}}
+        a = article("lk")
+        a.category = "sports"
+        self.assertEqual("sports", self.apply(src, [a])[0].category)
+
+    def test_url_categories_beats_pinned_category(self):
+        src = {"id": "lk", "category": "business",
+               "url_categories": {"news": "politics"}}
+        self.assertEqual("politics", self.apply(src, [article("lk")])[0].category)
+
+    def test_unknown_bucket_is_dropped_on_load(self):
+        """
+        ingest filters category feeds with `a.category == cat`, so a typo would
+        reach feed_{lang}.json and then never produce a category feed.
+        """
+        sources = [{"id": "lk", "category": "buisness",
+                    "url_categories": {"sport": "sprots", "biz": "business"}}]
+        ingest.validate_source_categories(sources)
+        self.assertNotIn("category", sources[0])
+        self.assertEqual({"biz": "business"}, sources[0]["url_categories"])
+
+    def test_valid_config_survives_validation(self):
+        sources = [{"id": "lk", "category": "business",
+                    "url_categories": {"sport": "sports"}}]
+        ingest.validate_source_categories(sources)
+        self.assertEqual("business", sources[0]["category"])
+        self.assertEqual({"sport": "sports"}, sources[0]["url_categories"])
+
+
+class CategoryPersistenceTests(SnapshotHarness):
+    """A category must not evaporate when a source degrades for one cycle."""
+
+    def items(self, categorised):
+        out = {}
+        for s in self.sources:
+            arts = [article(s["id"], s["lang"], age=i, n=i + 1) for i in range(3)]
+            if categorised:
+                arts[0].category = "business"
+            out[s["id"]] = arts
+        return out
+
+    def category_of(self, lang, n=1):
+        feed = json.loads((self.out / f"v1/feed_{lang}.json").read_text(encoding="utf-8"))
+        art = next(a for a in feed["articles"] if a["url"].endswith(f"/news/{n}"))
+        return art.get("category")
+
+    def test_category_is_written_and_round_trips(self):
+        self.assertEqual(0, self.run_ingest(self.items(categorised=True)))
+        self.assertEqual("business", self.category_of("en"))
+        self.assertTrue((self.out / "v1/feed_en_business.json").exists())
+
+    def test_category_survives_a_categoryless_refetch(self):
+        """
+        dedupe ranks fresh over cached before it looks at metadata, and then
+        replaces the object wholesale. One run of a source falling back to
+        Google would otherwise erase the bucket permanently.
+        """
+        self.assertEqual(0, self.run_ingest(self.items(categorised=True)))
+        self.assertEqual(0, self.run_ingest(self.items(categorised=False)))
+        self.assertEqual("business", self.category_of("en"))
+
+    def test_status_reports_category_coverage(self):
+        self.assertEqual(0, self.run_ingest(self.items(categorised=True)))
+        status = json.loads(self.diag.read_text(encoding="utf-8"))
+        en = status["language_status"]["en"]
+        self.assertEqual(1, en["categorised"])
+        self.assertEqual(2, en["uncategorised"])
+        self.assertEqual({"business": 1}, en["categories"])
 
 
 class WorkflowTests(unittest.TestCase):

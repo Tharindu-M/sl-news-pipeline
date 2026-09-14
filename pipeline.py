@@ -17,6 +17,7 @@ import threading
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
+from html import unescape
 from typing import Any, Iterable
 from urllib.parse import (urljoin, urlparse, urlunparse, parse_qsl,
                           urlencode, quote, quote_plus, urlsplit, urlunsplit)
@@ -483,6 +484,9 @@ def from_rss(client: httpx.Client, src: dict, limit: int = 40) -> list[Article]:
         if not valid_web_url(urljoin(src["site"], link)):
             continue
         url = canonical_url(link, src["site"])
+        # feedparser exposes <category> as `tags`. Most Sri Lankan feeds carry
+        # none (BBC Sinhala/Tamil and Ada Derana Tamil publish zero), but
+        # adaderana.lk/rss.php tags every item with its section.
         out.append(Article(
             id=article_id(url),
             source_id=src["id"],
@@ -493,6 +497,9 @@ def from_rss(client: httpx.Client, src: dict, limit: int = 40) -> list[Article]:
             published=published,
             excerpt=clean_text(e.get("summary") or e.get("description")),
             image=image,
+            category=category_from_terms(
+                *(t.get("term") for t in (e.get("tags") or [])
+                  if isinstance(t, dict))),
         ))
     return out
 
@@ -534,6 +541,17 @@ def from_wordpress(client: httpx.Client, src: dict, limit: int = 40) -> list[Art
         if embedded and isinstance(embedded[0], dict):
             image = embedded[0].get("source_url")
 
+        # `?_embed=1` already returned the post's terms alongside the image,
+        # so the section costs no extra request. wp:term is a list of lists
+        # (one per taxonomy); only the `category` taxonomy is a section --
+        # `post_tag` is free-form keywords and far too noisy to bucket on.
+        terms = []
+        for group in ((p.get("_embedded") or {}).get("wp:term") or []):
+            if not isinstance(group, list):
+                continue
+            terms += [t.get("name") for t in group
+                      if isinstance(t, dict) and t.get("taxonomy") == "category"]
+
         if not valid_web_url(urljoin(src["site"], link)):
             continue
         url = canonical_url(link, src["site"])
@@ -547,6 +565,7 @@ def from_wordpress(client: httpx.Client, src: dict, limit: int = 40) -> list[Art
             published=published,
             excerpt=clean_text((p.get("excerpt") or {}).get("rendered")),
             image=image,
+            category=category_from_terms(*terms),
         ))
     return out
 
@@ -573,6 +592,90 @@ NEWSFIRST_CATEGORIES = {
     "worldPost": "international",
     "businessPost": "business",
 }
+
+# Publisher section names -> ingest.CATEGORIES. Keys are the output of
+# normalise_term(), i.e. already casefolded and stripped of stray invisibles.
+#
+# The governing rule is the same one NEWSFIRST_CATEGORIES follows: a term only
+# earns a bucket when it names a *subject*. Placements ("news", "lead story",
+# "latest", "top-story", "breaking", "featured", "ප්‍රධාන පුවත්", "විගස පුවත්")
+# and format labels ("videos", "cartoons", "කාටූන්", "විශේෂාංග") are left out
+# on purpose, so they resolve to None. An unbucketed article is shown under
+# "All"; a miscategorised one is a bug the reader sees.
+CATEGORY_TERMS = {
+    # -- sports
+    "sports": "sports", "sport": "sports", "sports-news": "sports",
+    "sports news": "sports", "cricwire": "sports", "olympic": "sports",
+    "cricket": "sports", "ක්‍රීඩා": "sports", "விளையாட்டு": "sports",
+    # -- business. Sri Lankan outlets split this finely; economynext alone
+    # publishes under Economy, Markets, Fiscal, Monetary, Banking and more.
+    "business": "business", "business-news": "business",
+    "business news": "business", "economy": "business",
+    "general economy": "business", "markets": "business", "finance": "business",
+    "fiscal": "business", "monetary": "business", "banking": "business",
+    "trade": "business", "bizwire": "business", "biz talk": "business",
+    "stock watch": "business", "stocks & companies": "business",
+    "bonds & forex": "business", "shipping": "business", "logistics": "business",
+    "aviation": "business", "tourism": "business", "energy": "business",
+    "construction and real estate": "business",
+    "ගණුදෙනු ලොව": "business", "ව්‍යාපාර": "business", "வணிகம்": "business",
+    # -- politics
+    "politics": "politics", "political news": "politics", "election": "politics",
+    "දේශපාලන": "politics", "அரசியல்": "politics",
+    # -- tech
+    "tech": "tech", "technology": "tech", "sci-tech": "tech",
+    "science-and-tech": "tech", "science and technology": "tech",
+    "තාක්ෂණ": "tech", "தொழில்நுட்பம்": "tech",
+    # -- international
+    "world": "international", "international": "international",
+    "international news": "international", "international-news": "international",
+    "international relations": "international", "foreign": "international",
+    "විදෙස්": "international", "විදේශ": "international",
+    "உலகம்": "international", "சர்வதேசம்": "international",
+    # -- entertainment
+    "entertainment": "entertainment", "cinema": "entertainment",
+    "music": "entertainment", "සිනමා": "entertainment",
+    "විනෝදාස්වාද": "entertainment", "திரைப்படம்": "entertainment",
+    "சினிமா": "entertainment",
+    # -- society
+    "health": "society", "education": "society", "eduwire": "society",
+    "human rights": "society", "legal": "society", "environment": "society",
+    "සෞඛ්‍ය": "society", "අධ්‍යාපන": "society",
+    "சுகாதாரம்": "society", "கல்வி": "society",
+}
+
+# Stray invisibles that publishers leave inside category names. U+200B turns
+# up mid-word in Divaina's own taxonomy ("ක්‍රී​ඩා"), so a literal
+# "ක්‍රීඩා" would never match it.
+#
+# U+200D (ZWJ) is deliberately NOT stripped: it is load-bearing in Sinhala
+# orthography -- "ක්‍ර" is ක + virama + ZWJ + ර -- so removing it would corrupt
+# the very terms this table matches on.
+_INVISIBLE = str.maketrans("", "", "\u200b\ufeff\u00ad")
+
+
+def normalise_term(term: str | None) -> str | None:
+    """Fold a publisher's section name to a comparable key."""
+    if not term:
+        return None
+    text = unescape(str(term)).translate(_INVISIBLE)
+    text = re.sub(r"\s+", " ", text).strip().casefold()
+    return text or None
+
+
+def category_from_terms(*terms: Any) -> str | None:
+    """
+    First term that maps to a known bucket, or None.
+
+    Order matters: callers pass the publisher's own ordering, and the first
+    subject term beats a later one. Unknown terms are skipped rather than
+    guessed at.
+    """
+    for term in terms:
+        key = normalise_term(term)
+        if key and key in CATEGORY_TERMS:
+            return CATEGORY_TERMS[key]
+    return None
 
 
 def _newsfirst_posts(payload: Any) -> list[tuple[str, dict]]:
@@ -1279,6 +1382,16 @@ def dedupe(articles: Iterable[Article]) -> list[Article]:
             existing.collected_at = a.collected_at = first_seen
             if existing.date_estimated and a.date_estimated:
                 existing.published = a.published = min(existing.published, a.published)
+            # Carry the category across, like collected_at above. The quality
+            # tuple is lexicographic and `stale` outranks metadata richness, so
+            # a fresh category-less copy always beats a cached categorised one
+            # and then *replaces it wholesale*. Without this, one cycle of a
+            # source degrading to Google erases its categories permanently --
+            # the article keeps its id, so the bucket never comes back.
+            if existing.category and not a.category:
+                a.category = existing.category
+            elif a.category and not existing.category:
+                existing.category = a.category
         if existing is None or quality(a) > quality(existing):
             by_id[a.id] = a
 

@@ -9,6 +9,33 @@
 #
 # Once an outlet is confirmed, pin the adapter and the exact URL here. When a
 # site breaks, you change this file and re-run — no app release needed.
+#
+# ---------------------------------------------------------------- categories
+#
+# Articles carry an optional `category`, one of ingest.CATEGORIES (politics,
+# business, sports, tech, international, entertainment, society). Adapters
+# derive it for free where the publisher exposes a taxonomy: `wordpress` reads
+# wp:term out of the _embed response it already fetches, `rss` reads
+# <category>, `newsfirst` maps its API buckets. Everything below is for the
+# outlets that expose nothing.
+#
+#   url_categories:   {path segment: bucket}
+#     Matched against the article's own URL path. Use the publisher's real
+#     section slug. This is the ONLY signal that survives the Google fallback
+#     — the resolved link is the publisher's own — so it still works for a
+#     source that CI cannot reach directly.
+#
+#   category:         bucket
+#     Pins every article from this entry to one bucket. For registering a
+#     single section listing as its own source entry.
+#
+# Both are validated on load: a bucket that is not in ingest.CATEGORIES is
+# dropped with a warning, because it would otherwise ride into feed_{lang}.json
+# and never produce a category feed.
+#
+# Only ever map a *subject* section. Placements ("latest", "breaking",
+# "top-story", "main-news", "features") must be left unmapped: an unbucketed
+# article is shown under "All", a miscategorised one is a bug the reader sees.
 
 defaults:
   timeout: 20
@@ -36,6 +63,15 @@ sources:
     lang: en
     site: https://www.dailymirror.lk
     adapter: google         # fallback until a direct adapter is found
+    # Runs on Google, so every article arrives as a resolved dailymirror.lk
+    # link — the section is right there in the path. Segments seen on the
+    # homepage on 2026-09-14; breaking-news, headline, top-story, opinion,
+    # plus, features and Weekend_Online are placements and stay unmapped.
+    url_categories:
+      business-news: business
+      business: business
+      sports: sports
+      international: international
     # These were dropped by an earlier edit, so RSS was never actually tested
     # on this outlet. Try them: `python probe.py --id daily-mirror`.
     feeds:
@@ -79,6 +115,11 @@ sources:
     lang: en
     site: https://www.ft.lk
     adapter: google          # google only, 18h old
+    # Verified against resolved google links on 2026-09-14. front-page, news
+    # and columns are placements/opinion, so they stay unmapped.
+    url_categories:
+      business: business
+      sports: sports
 
   - id: the-morning
     name: The Morning
@@ -102,12 +143,31 @@ sources:
     lang: si
     site: https://www.divaina.lk
     adapter: wordpress       # CONFIRMED: 10 items, 9 with images
+    # Slugs verified against /wp-json/wp/v2/categories on 2026-09-14. The
+    # wordpress adapter already reads the Sinhala category names via wp:term;
+    # these matter when Cloudflare forces this source onto Google, because the
+    # resolved publisher URL still carries the section. Deliberately unmapped:
+    # main-news, breaking-news, provincial-news, features, editorial, cartoons,
+    # nakatha, horascope — placements, opinion or almanac, not subjects.
+    url_categories:
+      sports-news: sports
+      business-news: business
+      foreign-news: international
 
   - id: lankadeepa
     name: Lankadeepa
     lang: si
     site: https://www.lankadeepa.lk
     adapter: html            # CONFIRMED: 10 items, all with images
+    # No url_categories: article paths are /latest_news/<slug>/1-697107 and
+    # /features/<slug>/2-693861 — the segment is the placement the story was
+    # promoted into, never the subject, so mapping it would file politics
+    # under whatever section the editor happened to use.
+    # Subject listings do exist (/business/26, /politics/12, /sports/2,
+    # verified 2026-09-14) and could be registered as their own entries with a
+    # pinned `category:`. Not done here: it costs an extra fetch per section
+    # and puts "lankadeepa-business" in sources.json as if it were a separate
+    # newspaper. Revisit if Sinhala category coverage needs the volume.
     listings:
       - https://www.lankadeepa.lk/latest_news/1
       - https://www.lankadeepa.lk/breaking_news/1
@@ -197,6 +257,17 @@ sources:
     lang: ta
     site: https://www.tamilmirror.lk
     adapter: google          # google only, 8h old
+    # Sections are Tamil words, so these arrive percent-encoded in the path;
+    # apply_source_categories decodes before matching, so write them readably.
+    # Verified against resolved google links on 2026-09-14. This is currently
+    # the only subject signal in the whole Tamil feed -- Ada Derana Tamil and
+    # BBC Tamil publish no taxonomy at all. Unmapped on purpose: செய்திகள்
+    # (news) and பிரதான-செய்திகள் (main news) are placements, மலையகம் and
+    # கிழக்கு are regions, temple/astrology-main/video are not subjects.
+    url_categories:
+      பிரதான-விளையாட்டு: sports        # main sports
+      உள்ளூர்-விளையாட்டு: sports        # local sports
+      உலக-செய்திகள்: international      # world news
     listings:
       - https://www.tamilmirror.lk/breaking-news/150
       - https://www.tamilmirror.lk/latest-news/151

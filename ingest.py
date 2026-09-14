@@ -25,10 +25,11 @@ import json
 import logging
 import sys
 import tempfile
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import yaml
 from dateutil import parser as dateparser
@@ -87,6 +88,66 @@ def _can_try(adapter: str, src: dict) -> bool:
     if adapter == "newsfirst":
         return bool(src.get("api"))
     return True
+
+
+def validate_source_categories(sources: list[dict]) -> None:
+    """
+    Drop `category:` / `url_categories:` values that name no real bucket.
+
+    ingest filters category feeds with `a.category == cat` against CATEGORIES,
+    so a typo in sources.yaml would ride into feed_{lang}.json and then never
+    produce a feed_{lang}_{typo}.json -- invisible unless you go looking.
+    Fail loudly here instead.
+    """
+    for src in sources:
+        pinned = src.get("category")
+        if pinned is not None and pinned not in CATEGORIES:
+            log.warning("%s: unknown category %r in sources.yaml -- ignored "
+                        "(expected one of %s)", src["id"], pinned,
+                        ", ".join(CATEGORIES))
+            src.pop("category")
+        mapping = src.get("url_categories") or {}
+        for seg, bucket in list(mapping.items()):
+            if bucket not in CATEGORIES:
+                log.warning("%s: unknown category %r for url segment %r in "
+                            "sources.yaml -- ignored", src["id"], bucket, seg)
+                mapping.pop(seg)
+
+
+def apply_source_categories(registry: dict[str, dict],
+                            articles: list[Article]) -> None:
+    """
+    Fill in categories declared in sources.yaml, for articles no adapter
+    could bucket on its own.
+
+    Precedence: whatever the adapter derived (wp:term, RSS <category>) wins,
+    then `url_categories:`, then a flat `category:` pin. An adapter reads the
+    publisher's real taxonomy, so it is always the better evidence.
+
+    `url_categories` matches against the article's own URL path, which means
+    it only works once a Google redirect has been resolved to the publisher's
+    link. That is why this runs a second time after the enrich pass -- and it
+    is what lets a CloudFlare-blocked source like Divaina still get bucketed
+    while it is degraded to the Google fallback.
+    """
+    for art in articles:
+        if art.category:
+            continue
+        src = registry.get(art.source_id) or {}
+        mapping = src.get("url_categories") or {}
+        if mapping and not is_google_news(art.url):
+            # Tamil Mirror's sections are Tamil words, so the path arrives
+            # percent-encoded ("%E0%AE%89%E0%AE%B2%E0%AE%95-..."). Decode it
+            # so sources.yaml can carry the slug a human can read.
+            for raw in urlparse(art.url).path.split("/"):
+                if not raw:
+                    continue
+                bucket = mapping.get(raw) or mapping.get(unquote(raw))
+                if bucket:
+                    art.category = bucket
+                    break
+        if not art.category and src.get("category"):
+            art.category = src["category"]
 
 
 def fetch_source(client, src: dict, max_items: int) -> tuple[str, list[Article], dict]:
@@ -244,6 +305,7 @@ def main() -> int:
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     defaults = cfg.get("defaults", {})
     sources = [s for s in cfg["sources"] if s.get("enabled", True)]
+    validate_source_categories(sources)
     parked = len(cfg["sources"]) - len(sources)
     outdir = Path(args.out)
     diagnostics = Path(args.diagnostics)
@@ -299,6 +361,7 @@ def main() -> int:
             art.image = None
         validated.append(art)
     fresh = validated
+    apply_source_categories(registry, fresh)
     collected = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     for art in fresh:
         art.collected_at = collected
@@ -336,6 +399,9 @@ def main() -> int:
                         "(no og:published_time on the page)", still_estimated)
         # enrich() rewrites google redirect URLs, which changes article ids.
         fresh = dedupe(fresh)
+        # Re-run now that google links point at the publisher: url_categories
+        # can only read a section out of a real publisher path.
+        apply_source_categories(registry, fresh)
 
     client.close()
     google_total = sum(1 for a in fresh if is_google_news(a.url))
@@ -390,6 +456,11 @@ def main() -> int:
                 art.image = None
         combined = [a for a in fresh if a.lang == lang] + previous
         merged = [a for a in dedupe(combined) if a.published_dt >= cutoff]
+        # Also bucket the carried-over backlog. These are pure string rules on
+        # a URL we already have, so there is no reason to make 14 days of
+        # cached articles wait to age out before they gain a category -- and
+        # a newly added url_categories entry applies to them on the next run.
+        apply_source_categories(registry, merged)
         totals[lang] = len(merged)
 
         fresh_candidates = [a for a in merged if _first_seen_hours(a) <= LANG_FRESH_HOURS]
@@ -447,6 +518,18 @@ def main() -> int:
             except (ValueError, TypeError):
                 snapshot_age_hours = None
 
+        # Category coverage depends on publisher taxonomies that can be
+        # renamed without notice, and on sources that drop to the Google
+        # fallback. Track it here for the same reason as
+        # unresolved_google_links: a silent decay to zero should be visible.
+        #
+        # Count what was actually published, not `merged` -- on the preserved
+        # branch the file kept on disk is the *previous* snapshot, so merged
+        # would describe articles no client can see.
+        published = (payloads.get(f"feed_{lang}.json") or {}).get("articles", [])
+        by_category = Counter(
+            a["category"] for a in published if a.get("category"))
+
         language_status[lang] = {
             "state": state,
             "fresh_candidates": len(fresh_candidates),
@@ -454,6 +537,9 @@ def main() -> int:
             "total_candidates": len(merged),
             "snapshot_generated": generated if state == "updated" else prev_generated,
             "snapshot_age_hours": snapshot_age_hours,
+            "categorised": sum(by_category.values()),
+            "uncategorised": len(published) - sum(by_category.values()),
+            "categories": {c: by_category[c] for c in CATEGORIES if by_category[c]},
         }
         if state != "unavailable" and len(fresh_sources) < LANG_WARN_SOURCES:
             language_status[lang]["warning"] = (
