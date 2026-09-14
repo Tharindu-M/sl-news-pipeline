@@ -9,6 +9,7 @@ No server. GitHub Actions runs it; GitHub Pages serves it.
     https://<user>.github.io/<repo>/v1/feed_en.json
     https://<user>.github.io/<repo>/v1/feed_si.json
     https://<user>.github.io/<repo>/v1/feed_ta.json
+    https://<user>.github.io/<repo>/v1/feed_{lang}_{category}.json
     https://<user>.github.io/<repo>/v1/sources.json
     https://<user>.github.io/<repo>/v1/status.json     <- your health dashboard
 
@@ -26,7 +27,8 @@ Article shape:
   "date_estimated": false,
   "collected_at": "2026-09-12T04:40:00Z",
   "excerpt": "First ~220 characters...",
-  "image": "https://s3.amazonaws.com/adaderanasinhala/....jpg"
+  "image": "https://s3.amazonaws.com/adaderanasinhala/....jpg",
+  "category": "sports"
 }
 ```
 
@@ -39,8 +41,24 @@ without it use their existing timestamp when merged). Existing v1 consumers
 should tolerate the two additive fields.
 
 Feeds contain at most 150 articles per language, with a 14-day retention ceiling;
-this is not a complete archive or a paginated API. Categories are not currently
-assigned by adapters, so category endpoints are not part of the supported API.
+this is not a complete archive or a paginated API.
+
+`category` is **optional and sparse**. It is present only when a publisher
+states the section itself — a WordPress `wp:term`, an RSS `<category>`, a
+NewsFirst API bucket, or a section slug in the article's own URL mapped in
+`sources.yaml`. Nothing is inferred from the headline, so a story is left
+unbucketed rather than guessed at. Real coverage on 2026-09-14 was 13% of
+`feed_en`, 5% of `feed_ta` and 1% of `feed_si`; most Sri Lankan outlets file
+everything under a placement like "Breaking News" and expose no subject at
+all. Treat categories as a filter that enriches the feed, never as navigation
+the app depends on — build the UI around the all-articles feed and offer
+category tabs only where `status.json` shows the counts are worth it.
+
+Categories are one of `politics`, `business`, `sports`, `tech`,
+`international`, `entertainment`, `society`. `feed_{lang}_{category}.json` is
+written only for categories that actually have articles, so treat a 404 as an
+empty category rather than an error, and read `language_status[lang].categories`
+in `status.json` to discover which endpoints exist this run.
 
 ## Setup
 

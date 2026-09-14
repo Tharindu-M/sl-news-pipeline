@@ -28,9 +28,12 @@ Article shape (fields are omitted when null):
   "url": "https://sinhala.adaderana.lk/news/251377",
   "published": "2026-09-12T13:04:00Z",
   "excerpt": "First ~220 characters...",
-  "image": "https://..."
+  "image": "https://...",
+  "category": "sports"
 }
 ```
+
+`category` is optional and sparse — see "Categories" below.
 
 ## Layout
 
@@ -93,6 +96,56 @@ date, then missing images (capped at 250).
 for one cycle doesn't empty the feed. `dedupe` ranks fresh over cached, real
 dates over estimated, then metadata richness. A total failure refuses to
 overwrite good feeds.
+
+## Categories
+
+`category` is filled **only from what a publisher states**, never inferred
+from the text. Four sources feed it, in precedence order:
+
+1. `wordpress` reads `wp:term` out of the `_embed` response it already
+   fetches — no extra request.
+2. `rss` reads `<category>`.
+3. `newsfirst` maps its API buckets (`NEWSFIRST_CATEGORIES`).
+4. `sources.yaml` declares `url_categories:` (a `{path segment: bucket}` map
+   against the article's own URL) or `category:` (pins a whole entry).
+
+`CATEGORY_TERMS` in `pipeline.py` normalises site terms across all three
+languages. **Only subject sections are mapped.** Placements — "News", "Lead
+Story", "latest", "top-story", `ප්‍රධාන පුවත්`, `විගස පුවත්` — are deliberately
+absent so they resolve to `None`. An unbucketed article is shown under "All";
+a miscategorised one is a bug the reader sees.
+
+`normalise_term` strips U+200B/U+FEFF/U+00AD but **must not strip U+200D**:
+ZWJ is load-bearing in Sinhala (`ක්‍ර` is ක + virama + ZWJ + ර). Divaina's own
+taxonomy spells sports `ක්‍රී​ඩා` — required ZWJ *plus* a stray ZWSP mid-word —
+so a literal `ක්‍රීඩා` never matches it without normalisation.
+
+`url_categories` is matched after Google resolution, decoded: it is the only
+signal that survives the Google fallback, because the resolved link is the
+publisher's own. Tamil Mirror's sections are Tamil words and arrive
+percent-encoded, so write the readable slug in `sources.yaml`.
+
+**Coverage is low and that is the data, not a bug** — 13% `en`, 5% `ta`, 1%
+`si` on 2026-09-14. Most outlets file everything under one placement: every
+recent Divaina post on `/wp-json` is `විගස පුවත්` (breaking news), and Ada
+Derana's sitemap path carries no section at all. `status.json`
+(`language_status[lang].categories`) tracks it so a silent decay is visible.
+
+**Dead ends — do not re-attempt** (all probed 2026-09-14):
+
+| tried | result |
+|---|---|
+| per-category Google queries | keyword form mis-buckets badly (a drug-deaths story and a political meeting returned under "sports"); path form (`site:x/business`) returns 0-2 results. Google matches the page, not the section. |
+| BBC topic feeds | `feeds.bbci.co.uk/{sinhala,tamil}/{sport,world,business,…}/rss.xml` all 302 to the root feed — HTTP 200, non-empty, byte-identical. Always verify a section endpoint differs *from root*. |
+| `article:section` / JSON-LD `articleSection` | sampled all 18 sources: only newswire (`"News"`, a placement) and divaina. Not worth wiring into `enrich`. |
+| `adaderanatamil.lk/rss.xml?cat=sports` | param ignored, returns the root feed. |
+| lankadeepa `url_categories` | article paths (`/latest_news/<slug>/1-697107`) are placements, not subjects. Its `/business/26` and `/politics/12` listings are real and could be registered with a pinned `category:` — costs a fetch per section and adds a pseudo-source to `sources.json`. |
+
+Ada Derana's `rss.php` *does* tag every item with its section
+(`sports`, `science-and-tech`, `international-news`), but those domains are
+CloudFront-blocked from CI, and both sources are pinned to `sitemap`. If that
+block ever lifts, switching them to `rss` is the single biggest category win
+available.
 
 ## Constraints that are deliberate
 
