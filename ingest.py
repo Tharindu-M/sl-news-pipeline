@@ -479,26 +479,39 @@ def main() -> int:
                 "count": len(merged[:PER_FEED]),
                 "articles": [a.to_dict() for a in merged[:PER_FEED]],
             }
+            # Every category is published, empty ones included, so clients can
+            # rely on a fixed endpoint set and treat a 404 as a real error
+            # rather than "this bucket happened to be empty this run".
             for cat in CATEGORIES:
                 subset = [a for a in merged if a.category == cat][:PER_FEED]
-                if subset:
-                    payloads[f"feed_{lang}_{cat}.json"] = {
-                        "version": API_VERSION,
-                        "lang": lang,
-                        "category": cat,
-                        "generated": generated,
-                        "count": len(subset),
-                        "articles": [a.to_dict() for a in subset],
-                    }
+                payloads[f"feed_{lang}_{cat}.json"] = {
+                    "version": API_VERSION,
+                    "lang": lang,
+                    "category": cat,
+                    "generated": generated,
+                    "count": len(subset),
+                    "articles": [a.to_dict() for a in subset],
+                }
             log.info("feed_%s.json  %d articles (updated, %d fresh from %d source(s))",
                      lang, len(merged[:PER_FEED]), len(fresh_candidates), len(fresh_sources))
         elif prev_payload is not None:
             state = "preserved"
             payloads[f"feed_{lang}.json"] = prev_payload
+            # Same fixed endpoint set as the updated branch. A category with no
+            # previous file (it was empty before this guarantee, or empty under
+            # an older build) is synthesised empty rather than left to 404.
+            # It carries the preserved snapshot's own timestamp, not this run's,
+            # so every file in a preserved language agrees on `generated`.
             for cat in CATEGORIES:
                 prev_cat = load_previous_payload(outdir, f"feed_{lang}_{cat}.json")
-                if prev_cat is not None:
-                    payloads[f"feed_{lang}_{cat}.json"] = prev_cat
+                payloads[f"feed_{lang}_{cat}.json"] = prev_cat if prev_cat is not None else {
+                    "version": API_VERSION,
+                    "lang": lang,
+                    "category": cat,
+                    "generated": prev_payload.get("generated", generated),
+                    "count": 0,
+                    "articles": [],
+                }
             log.warning("feed_%s.json  below quality bar (%d fresh article(s) from "
                         "%d source(s), need >=%d from >=%d) -- preserving previous "
                         "snapshot unchanged", lang, len(fresh_candidates),
@@ -539,7 +552,9 @@ def main() -> int:
             "snapshot_age_hours": snapshot_age_hours,
             "categorised": sum(by_category.values()),
             "uncategorised": len(published) - sum(by_category.values()),
-            "categories": {c: by_category[c] for c in CATEGORIES if by_category[c]},
+            # Every bucket, zeros included: the published endpoint set is fixed,
+            # so this is tab counts rather than a discovery document.
+            "categories": {c: by_category[c] for c in CATEGORIES},
         }
         if state != "unavailable" and len(fresh_sources) < LANG_WARN_SOURCES:
             language_status[lang]["warning"] = (

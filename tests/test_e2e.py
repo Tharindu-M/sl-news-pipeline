@@ -54,6 +54,13 @@ st = json.loads(Path("tests/out/v1/status.json").read_text())
 check("status flags broken source", st["detail"]["broken"]["ok"] is False and "Cloudflare" in st["detail"]["broken"]["error"])
 check("status counts healthy", st["sources_ok"] == 3, st["sources_ok"])
 check("category feed written", Path("tests/out/v1/feed_en_politics.json").exists())
+# Every category is published, so an endpoint the fixture never fills must
+# still be a valid empty payload rather than a missing file.
+_empty = json.loads(Path("tests/out/v1/feed_en_society.json").read_text())
+check("empty category feed written", _empty["count"] == 0 and _empty["articles"] == [], _empty)
+check("all category feeds present",
+      all(Path(f"tests/out/v1/feed_{l}_{c}.json").exists()
+          for l in ("en", "si", "ta") for c in ingest.CATEGORIES))
 check("sources.json written", Path("tests/out/v1/sources.json").exists())
 
 # --- second run must merge, not clobber ---

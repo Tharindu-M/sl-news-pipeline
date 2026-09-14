@@ -228,12 +228,21 @@ class SnapshotTests(SnapshotHarness):
         }))
         self.assertFalse((self.out / "v1").exists())
 
-    def test_obsolete_category_file_removed_on_success(self):
+    def test_stale_category_file_is_replaced_on_success(self):
+        """
+        publish_snapshot swaps the whole v1/ directory rather than writing in
+        place, so a hand-written leftover cannot survive a run. Every category
+        file is published now, so the proof is that the *content* was replaced,
+        not that the file disappeared.
+        """
         self.seed()
         stale_file = self.out / "v1/feed_en_politics.json"
         stale_file.write_text('{"articles":[]}', encoding="utf-8")
         self.seed()
-        self.assertFalse(stale_file.exists())
+        published = json.loads(stale_file.read_text(encoding="utf-8"))
+        self.assertEqual("politics", published["category"])
+        self.assertIn("version", published)
+        self.assertIn("generated", published)
 
     def test_staging_write_failure_leaves_snapshot_untouched(self):
         self.seed()
@@ -417,7 +426,89 @@ class CategoryPersistenceTests(SnapshotHarness):
         en = status["language_status"]["en"]
         self.assertEqual(1, en["categorised"])
         self.assertEqual(2, en["uncategorised"])
-        self.assertEqual({"business": 1}, en["categories"])
+        # every bucket is reported, so the counts can drive tab labels directly
+        self.assertEqual(1, en["categories"]["business"])
+        self.assertEqual(0, en["categories"]["politics"])
+        self.assertEqual(set(ingest.CATEGORIES), set(en["categories"]))
+
+
+class CategoryEndpointTests(SnapshotHarness):
+    """Every category endpoint exists, so a 404 means a real error."""
+
+    def unreachable_bar(self):
+        """
+        Rewrite the config so no language can clear the freshness bar.
+
+        Sources still return articles -- returning none instead would trip the
+        separate total-failure guard, which is a different code path.
+        """
+        self.config.write_text(
+            yaml.safe_dump({"defaults": {"lang_min_fresh_articles": 99},
+                            "sources": self.sources}),
+            encoding="utf-8")
+
+    def items(self):
+        return {s["id"]: [article(s["id"], s["lang"], age=i, n=i + 1)
+                          for i in range(3)]
+                for s in self.sources}
+
+    def payload(self, name):
+        return json.loads((self.out / "v1" / name).read_text(encoding="utf-8"))
+
+    def test_every_category_is_published_even_when_empty(self):
+        self.seed()
+        for lang in ("en", "si", "ta"):
+            for cat in ingest.CATEGORIES:
+                path = self.out / f"v1/feed_{lang}_{cat}.json"
+                self.assertTrue(path.exists(), f"missing feed_{lang}_{cat}.json")
+
+    def test_an_empty_category_is_a_valid_empty_payload(self):
+        """Not a stub: same envelope as a populated feed, with zero articles."""
+        self.seed()
+        empty = self.payload("feed_en_politics.json")
+        self.assertEqual(0, empty["count"])
+        self.assertEqual([], empty["articles"])
+        self.assertEqual("politics", empty["category"])
+        self.assertEqual("en", empty["lang"])
+        self.assertIn("generated", empty)
+
+    def test_preserved_language_still_publishes_every_category(self):
+        """
+        The preserved branch copies last run's category files. One that has no
+        previous file must be synthesised rather than left to 404.
+        """
+        self.seed()
+        (self.out / "v1/feed_en_politics.json").unlink()
+        before = self.payload("feed_en.json")["generated"]
+
+        self.unreachable_bar()
+        self.assertEqual(0, self.run_ingest(self.items()))
+
+        self.assertEqual("preserved",
+                         json.loads(self.diag.read_text(encoding="utf-8"))
+                         ["language_status"]["en"]["state"])
+        restored = self.payload("feed_en_politics.json")
+        self.assertEqual(0, restored["count"])
+        # the preserved snapshot's timestamp, not this run's
+        self.assertEqual(before, restored["generated"])
+
+    def test_unavailable_language_publishes_no_category_files(self):
+        """
+        The one documented exception: with no feed_{lang}.json there are no
+        feed_{lang}_{cat}.json either, rather than claiming a language exists.
+        """
+        self.unreachable_bar()
+        self.run_ingest(self.items())
+        self.assertFalse((self.out / "v1/feed_en.json").exists())
+        for cat in ingest.CATEGORIES:
+            self.assertFalse((self.out / f"v1/feed_en_{cat}.json").exists())
+
+    def test_status_lists_every_category_including_zeros(self):
+        self.seed()
+        cats = (json.loads(self.diag.read_text(encoding="utf-8"))
+                ["language_status"]["en"]["categories"])
+        self.assertEqual(set(ingest.CATEGORIES), set(cats))
+        self.assertEqual(0, cats["politics"])
 
 
 class WorkflowTests(unittest.TestCase):
