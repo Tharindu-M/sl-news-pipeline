@@ -55,10 +55,18 @@ the app depends on — build the UI around the all-articles feed and offer
 category tabs only where `status.json` shows the counts are worth it.
 
 Categories are one of `politics`, `business`, `sports`, `tech`,
-`international`, `entertainment`, `society`. `feed_{lang}_{category}.json` is
-written only for categories that actually have articles, so treat a 404 as an
-empty category rather than an error, and read `language_status[lang].categories`
-in `status.json` to discover which endpoints exist this run.
+`international`, `entertainment`, `society`.
+
+**All seven `feed_{lang}_{category}.json` endpoints are always published**, so
+the client can hardcode the tab set. A category with nothing in it returns 200
+with `"count": 0` and `"articles": []` — never a 404. Treat a 404 as a real
+error. `language_status[lang].categories` in `status.json` carries the count
+for every bucket (zeros included), which is enough to label or grey out tabs
+without fetching each feed.
+
+The one exception: if a language fails completely and has no cached snapshot
+to fall back on, `feed_{lang}.json` is not published that run and neither are
+its category files. In that state the whole language 404s, not just a category.
 
 ## Setup
 

@@ -125,11 +125,25 @@ signal that survives the Google fallback, because the resolved link is the
 publisher's own. Tamil Mirror's sections are Tamil words and arrive
 percent-encoded, so write the readable slug in `sources.yaml`.
 
-**Coverage is low and that is the data, not a bug** — 13% `en`, 5% `ta`, 1%
-`si` on 2026-09-14. Most outlets file everything under one placement: every
-recent Divaina post on `/wp-json` is `විගස පුවත්` (breaking news), and Ada
+**Coverage is low and that is the data, not a bug** — 13% `en`, 8% `si`, 7%
+`ta` from CI on 2026-09-14. Most outlets file everything under one placement:
+every recent Divaina post on `/wp-json` is `විගස පුවත්` (breaking news), and Ada
 Derana's sitemap path carries no section at all. `status.json`
-(`language_status[lang].categories`) tracks it so a silent decay is visible.
+(`language_status[lang].categories`) reports every bucket including zeros, so a
+silent decay is visible.
+
+Sinhala scores *better* from CI than from a home connection, which looks
+backwards. It is `url_categories` doing the work: from home Divaina answers
+directly and its `/wp-json` returns nothing but placements, while from CI it
+degrades to Google and the resolved links carry real `/sports-news/` and
+`/foreign-news/` paths. The fallback path buckets better than the direct one.
+
+**All seven category feeds are published every run**, empty ones included, so
+clients get `"count": 0` rather than a 404 and can hardcode the tab set.
+Dropping that guarantee would break the Android tab row. The single exception
+is the `unavailable` state: when a language has no usable articles *and* no
+previous snapshot, `feed_{lang}.json` is not written and neither are its
+category files — a category feed never outlives its parent feed.
 
 **Dead ends — do not re-attempt** (all probed 2026-09-14):
 
